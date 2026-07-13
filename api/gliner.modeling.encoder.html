@@ -64,6 +64,7 @@ data-aria-dark="Switch to auto color mode">
 <li class="toctree-l1"><a class="reference internal" href="../training.html">Training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../architectures.html">Architectures</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../convert_to_onnx.html">ONNX Export &amp; Deployment</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../serving.html">Serving</a></li>
 </ul>
 <p class="caption" role="heading" aria-level="3"><span class="caption-text">API Reference</span></p>
 <ul class="current">
@@ -534,8 +535,8 @@ to produce sentence-level representations.</p>
 <li><p><strong>input_ids</strong> (<em>Tensor</em>) – Label token IDs of shape (batch_size, seq_len).</p></li>
 <li><p><strong>attention_mask</strong> (<em>Tensor</em>) – Attention mask of shape (batch_size, seq_len).</p></li>
 <li><p><strong>*args</strong> (<em>Any</em>) – Additional positional arguments.</p></li>
-<li><p><strong>**kwargs</strong> (<em>Any</em>) – Additional keyword arguments (packing_config and pair_attention_mask
-are removed as they’re not supported for labels).</p></li>
+<li><p><strong>**kwargs</strong> (<em>Any</em>) – Additional keyword arguments (packing_config, pair_attention_mask
+and token_lengths are removed as they’re not supported for labels).</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
