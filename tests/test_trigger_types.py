@@ -128,6 +128,7 @@ def test_train_main_derives_trigger_types_end_to_end(tmp_path, monkeypatch):
     cfg["data"]["train_data"] = str(fixture)
     cfg["data"]["val_data"] = None
     cfg["data"]["test_data"] = None
+    cfg["training"]["logging_steps"] = 7  # exercise the yaml logging_steps knob
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg))
 
@@ -135,6 +136,7 @@ def test_train_main_derives_trigger_types_end_to_end(tmp_path, monkeypatch):
 
     def fake_train_model(self, *args, **kwargs):
         captured["trigger_types"] = list(getattr(self.config, "trigger_types", []) or [])
+        captured["train_kwargs"] = kwargs
         return None
 
     monkeypatch.setattr(BaseGLiNER, "train_model", fake_train_model)
@@ -144,3 +146,6 @@ def test_train_main_derives_trigger_types_end_to_end(tmp_path, monkeypatch):
     assert captured.get("trigger_types"), "train.main() built the model without deriving trigger_types"
     # WikiEvents trigger labels are dotted event types (e.g. Life.Die.Unspecified).
     assert all("." in t for t in captured["trigger_types"])
+    # config logging_steps flows through: epoch schedule switches to step logging.
+    assert captured["train_kwargs"].get("logging_steps") == 7
+    assert captured["train_kwargs"].get("logging_strategy") == "steps"

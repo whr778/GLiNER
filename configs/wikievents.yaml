@@ -62,7 +62,7 @@ training:
   prev_path: null  # Use null for training from scratch, or path/repo for fine-tuning
 
   # Training Parameters
-  num_epochs: 3  # Evaluated at the end of every epoch, not by step.
+  num_epochs: 15  # Evaluated at the end of every epoch, not by step.
   early_stopping_patience: 5  # Stop after N evals with no F1 improvement. Kept
     # generous for events: entity NER plateaus early while event roles learn
     # slower, so a tight patience can halt before roles improve.
@@ -71,6 +71,8 @@ training:
   # Higher weights the event-role side so the tracked metric keeps improving
   # while roles are still learning, instead of following entity NER.
   rel_metric_weight: 0.7
+  logging_steps: 10  # Log loss + span/adj/rel components every N steps. Omit to
+    # log once per epoch. Lower = more frequent visibility into event-head learning.
   train_batch_size: 4
   gradient_accumulation_steps: 4  # Effective batch size = train_batch_size x this. Raise to grow the effective batch without more memory.
   window_stride: null  # Overlap (word tokens) between sliding-window chunks for documents

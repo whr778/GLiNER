@@ -166,6 +166,14 @@ def main(cfg_path: str):
     # must be explicitly -1 for num_train_epochs to actually take effect,
     # since create_training_args defaults max_steps to 10000 otherwise and
     # HF Trainer lets a positive max_steps silently override num_train_epochs.
+    # Optional: log training metrics (loss + span/adj/rel components) every N
+    # steps. Set `logging_steps` in the config's training section. On the
+    # epoch-based schedule it switches logging to step cadence while eval/save
+    # stay per-epoch; on the step-based schedule it overrides the eval_every
+    # default. Unset -> log once per epoch (epoch schedule) or every eval_every
+    # steps (step schedule).
+    logging_steps = getattr(cfg.training, "logging_steps", None)
+
     num_epochs = getattr(cfg.training, "num_epochs", None)
     if num_epochs is not None:
         schedule_kwargs = {
@@ -175,13 +183,16 @@ def main(cfg_path: str):
             "save_strategy": "epoch",
             "logging_strategy": "epoch",
         }
+        if logging_steps:
+            schedule_kwargs["logging_strategy"] = "steps"
+            schedule_kwargs["logging_steps"] = int(logging_steps)
         schedule_desc = f"{num_epochs} epochs"
     else:
         schedule_kwargs = {
             "max_steps": cfg.training.num_steps,
             "save_steps": cfg.training.eval_every,
-            "logging_steps": cfg.training.eval_every,
-            # Eval runs at the same cadence as save/logging so BestF1Callback fires.
+            "logging_steps": int(logging_steps) if logging_steps else cfg.training.eval_every,
+            # Eval runs at the same cadence as save so BestF1Callback fires.
             "eval_strategy": "steps" if eval_dataset is not None else "no",
             "eval_steps": cfg.training.eval_every,
         }
