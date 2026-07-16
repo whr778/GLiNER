@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import shutil
 from tqdm import tqdm
 
 from transformers import (
@@ -41,37 +42,28 @@ from gliner.training.data_utils import (
 )
 
 
-def save_top_k_checkpoints(model: GLiNER, save_path: str, checkpoint: int, top_k: int = 5):
+def save_top_k_checkpoints(model: GLiNER, save_path: str, checkpoint: int, top_k: int = 3):
     """
-    Save the top-k checkpoints (latest k checkpoints) of a model and tokenizer.
+    Save the model+tokenizer and keep only the latest ``top_k`` checkpoints.
 
     Parameters:
         model (GLiNER): The model to save.
         save_path (str): The directory path to save the checkpoints.
-        top_k (int): The number of top checkpoints to keep. Defaults to 5.
+        checkpoint: Checkpoint name (folder) to save under ``save_path``.
+        top_k (int): The number of most-recent checkpoints to keep. Defaults to 3.
     """
     # Save the current model and tokenizer
     if isinstance(model, DDP):
         model.module.save_pretrained(os.path.join(save_path, str(checkpoint)))
     else:
         model.save_pretrained(os.path.join(save_path, str(checkpoint)))
-    
-    # List all files in the directory
-    files = os.listdir(save_path)
 
-    # Filter files to keep only the model checkpoints
-    checkpoint_folders = [file for file in files if re.search(r'model_\d+', file)]
-
-    # Sort checkpoint files by modification time (latest first)
+    # Sort existing checkpoints newest-first, drop everything past top_k.
+    checkpoint_folders = [f for f in os.listdir(save_path) if re.search(r'model_\d+', f)]
     checkpoint_folders.sort(key=lambda x: os.path.getmtime(os.path.join(save_path, x)), reverse=True)
 
-    # Keep only the top-k checkpoints
     for checkpoint_folder in checkpoint_folders[top_k:]:
-        checkpoint_folder = os.path.join(save_path, checkpoint_folder)
-        checkpoint_files = [os.path.join(checkpoint_folder, f) for f in os.listdir(checkpoint_folder)]
-        for file in checkpoint_files:
-            os.remove(file)
-        os.rmdir(os.path.join(checkpoint_folder))
+        shutil.rmtree(os.path.join(save_path, checkpoint_folder), ignore_errors=True)
 
 
 class Trainer:
@@ -252,7 +244,7 @@ class Trainer:
 
         warmup_ratio = self.config.warmup_ratio
         eval_every = self.config.eval_every
-        save_total_limit = self.config.save_total_limit
+        save_total_limit = int(getattr(self.config, "save_total_limit", 3))
         log_dir = self.config.log_dir
 
         num_warmup_steps = int(num_steps * warmup_ratio) if warmup_ratio < 1 else int(warmup_ratio)

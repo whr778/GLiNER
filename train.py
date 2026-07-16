@@ -231,7 +231,7 @@ def main(cfg_path: str):
         loss_reduction=cfg.training.loss_reduction,
         negatives=float(cfg.training.negatives),
         masking=cfg.training.masking,
-        save_total_limit=cfg.training.save_total_limit,
+        save_total_limit=int(getattr(cfg.training, "save_total_limit", 3)),
         **schedule_kwargs,
         # Freezing
         freeze_components=freeze_components,

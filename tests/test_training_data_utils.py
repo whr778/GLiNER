@@ -353,7 +353,33 @@ class TestFlattenNamespace:
         assert not hasattr(cfg.data, "c")
 
 
-class TestBuildTestMetrics:
+class TestSaveTopKCheckpoints:
+    def _load_fn(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from custom_train import save_top_k_checkpoints
+        return save_top_k_checkpoints
+
+    def _fake_model(self):
+        class FakeModel:
+            def save_pretrained(self, path):
+                import os
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, "pytorch_model.bin"), "w") as fh:
+                    fh.write("x")
+        return FakeModel()
+
+    def test_default_keeps_three_and_removes_whole_folders(self, tmp_path):
+        import time
+        save = self._load_fn()
+        model = self._fake_model()
+        for step in (100, 200, 300, 400, 500):
+            save(model, str(tmp_path), f"model_{step}")  # default top_k=3
+            time.sleep(0.02)  # distinct mtimes for the newest-first sort
+        remaining = sorted(p.name for p in tmp_path.iterdir())
+        # only the 3 newest survive, and the dropped ones are fully gone (not empty dirs)
+        assert remaining == ["model_300", "model_400", "model_500"]
     def test_ner_string_output_has_no_head_split(self):
         m = build_test_metrics(0.8, "Strict - P: 80%\tR: 80%\tF1: 80%", event_mode=False)
         assert m["overall_f1"] == 0.8
