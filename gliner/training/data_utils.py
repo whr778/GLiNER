@@ -269,6 +269,26 @@ def print_blind_test(name: str, f1: float, output: Any, event_mode: bool = False
     print(format_evaluate_output(output, event_mode=event_mode))
 
 
+def build_test_metrics(f1: float, output: Any, event_mode: bool = False) -> Dict[str, Any]:
+    """Normalize a blind-test ``(f1, output)`` into the model card's test-metrics dict.
+
+    ``report`` is the same labeled strict/relaxed + per-label text
+    ``print_blind_test`` shows, embedded verbatim in the card's evaluation
+    section (no fragile re-parsing of the evaluator's report string). For
+    RelEx/event models the ``((entity_output, entity_f1), (pair_output,
+    pair_f1))`` shape also exposes the two head F1s separately as headline
+    numbers.
+    """
+    metrics: Dict[str, Any] = {"overall_f1": f1, "report": format_evaluate_output(output, event_mode=event_mode)}
+    if isinstance(output, tuple) and len(output) == 2 and isinstance(output[0], tuple):
+        (_, entity_f1), (_, pair_f1) = output
+        metrics["entity_label"] = "Trigger/entity" if event_mode else "Entity"
+        metrics["pair_label"] = "Event role" if event_mode else "Relation"
+        metrics["entity_f1"] = entity_f1
+        metrics["pair_f1"] = pair_f1
+    return metrics
+
+
 def blind_test_by_language(model, test_records: List[Dict], evaluate_kwargs: Dict) -> Tuple[float, Any]:
     """Run the blind test per language, then once over all data combined.
 

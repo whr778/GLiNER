@@ -69,3 +69,23 @@ def test_write_model_card_creates_readme(tmp_path):
     path = write_model_card(tmp_path, _event_config(), summarize_training_data(RECORDS), best_f1=0.5)
     assert path == tmp_path / "README.md"
     assert path.read_text().startswith("---\n")
+
+
+def test_card_includes_blind_test_evaluation():
+    tm = {
+        "overall_f1": 0.4842, "entity_f1": 0.574, "pair_f1": 0.3944,
+        "entity_label": "Trigger/entity", "pair_label": "Event role",
+        "report": "Trigger/entity: Strict - P: 55.00% R: 60.00% F1: 57.40%",
+    }
+    card = render_model_card(_event_config(), summarize_training_data(RECORDS), best_f1=0.51, test_metrics=tm)
+    assert "## Evaluation" in card
+    assert "Blind-test F1 (overall):** 0.4842" in card
+    assert "Trigger/entity F1:** 0.5740" in card
+    assert "Event role F1:** 0.3944" in card
+    assert "<details>" in card and "F1: 57.40%" in card       # full report, collapsible
+    assert "Best validation F1:** 0.5100" in card             # validation F1 kept alongside
+
+
+def test_card_without_test_metrics_has_no_evaluation_section():
+    card = render_model_card(_event_config(), summarize_training_data(RECORDS), best_f1=0.5)
+    assert "## Evaluation" not in card

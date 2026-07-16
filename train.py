@@ -7,11 +7,12 @@ from transformers import TrainerCallback
 
 from gliner import GLiNER
 from gliner.data_processing.trigger_types import apply_derived_trigger_types
-from gliner.training.model_card import summarize_training_data
+from gliner.training.model_card import summarize_training_data, write_model_card
 from gliner.training.data_utils import (
     DEFAULT_THRESHOLD_GRID,
     BestModelTracker,
     blind_test_by_language,
+    build_test_metrics,
     evaluate_and_extract_f1,
     load_multi_dataset,
     print_blind_test,
@@ -185,16 +186,16 @@ def main(cfg_path: str):
     early_stopping_patience = getattr(cfg.training, "early_stopping_patience", None)
 
     callbacks = []
+    best_cb = None
     if eval_dataset is not None:
-        callbacks.append(
-            BestF1Callback(
-                eval_dataset,
-                output_dir,
-                evaluate_kwargs={"window_stride": window_stride, "threshold": threshold},
-                patience=early_stopping_patience,
-                data_stats=data_stats,
-            )
+        best_cb = BestF1Callback(
+            eval_dataset,
+            output_dir,
+            evaluate_kwargs={"window_stride": window_stride, "threshold": threshold},
+            patience=early_stopping_patience,
+            data_stats=data_stats,
         )
+        callbacks.append(best_cb)
 
     # Train
     print(f"\nStarting training ({schedule_desc})...")
@@ -256,15 +257,27 @@ def main(cfg_path: str):
         print(f"[threshold sweep] Wrote {sweep_path}")
 
     if test_dataset is not None:
+        event_mode = bool(getattr(model.config, "event_mode", False))
         if eval_by_language:
-            blind_test_by_language(
+            f1, output = blind_test_by_language(
                 model, test_dataset, evaluate_kwargs={"window_stride": window_stride, "threshold": threshold}
             )
         else:
             f1, output = evaluate_and_extract_f1(
                 model, test_dataset, window_stride=window_stride, threshold=threshold
             )
-            print_blind_test("all", f1, output, event_mode=bool(getattr(model.config, "event_mode", False)))
+            print_blind_test("all", f1, output, event_mode=event_mode)
+
+        # Add the blind-test metrics to the saved best model's card.
+        if best_dir.is_dir():
+            write_model_card(
+                best_dir,
+                model.config,
+                data_stats=data_stats,
+                best_f1=best_cb.tracker.best_f1 if best_cb else None,
+                test_metrics=build_test_metrics(f1, output, event_mode),
+            )
+            print(f"[model card] Added blind-test metrics to {best_dir / 'README.md'}")
 
 
 if __name__ == "__main__":

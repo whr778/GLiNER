@@ -14,6 +14,7 @@ from gliner.training.data_utils import (
     evaluate_and_extract_f1,
     flatten_namespace,
     format_evaluate_output,
+    build_test_metrics,
     load_multi_dataset,
     print_blind_test,
     sweep_thresholds,
@@ -326,6 +327,25 @@ class TestFlattenNamespace:
         flatten_namespace(cfg)
         assert not hasattr(cfg.model, "b")
         assert not hasattr(cfg.data, "c")
+
+
+class TestBuildTestMetrics:
+    def test_ner_string_output_has_no_head_split(self):
+        m = build_test_metrics(0.8, "Strict - P: 80%\tR: 80%\tF1: 80%", event_mode=False)
+        assert m["overall_f1"] == 0.8
+        assert "Strict" in m["report"]
+        assert "entity_f1" not in m and "pair_f1" not in m
+
+    def test_event_tuple_output_splits_head_f1s_and_labels(self):
+        output = (("entity report", 0.6), ("role report", 0.4))
+        m = build_test_metrics(0.5, output, event_mode=True)
+        assert m["entity_f1"] == 0.6 and m["pair_f1"] == 0.4
+        assert m["entity_label"] == "Trigger/entity" and m["pair_label"] == "Event role"
+        assert "Trigger/entity" in m["report"] and "Event role" in m["report"]
+
+    def test_relex_tuple_uses_entity_relation_labels(self):
+        m = build_test_metrics(0.5, (("e", 0.6), ("r", 0.4)), event_mode=False)
+        assert m["entity_label"] == "Entity" and m["pair_label"] == "Relation"
 
 
 class TestWarnIfMaxTypesTruncates:

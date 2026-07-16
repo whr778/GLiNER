@@ -112,6 +112,28 @@ def _training_data_section(data_stats: Optional[Dict[str, Any]]) -> str:
     )
 
 
+def _evaluation_section(test_metrics: Optional[Dict[str, Any]]) -> str:
+    if not test_metrics:
+        return ""
+    out = "## Evaluation\n\nHeld-out **blind-test** results (test split):\n\n"
+    overall = test_metrics.get("overall_f1")
+    if overall is not None:
+        out += f"- **Blind-test F1 (overall):** {overall:.4f}\n"
+    if test_metrics.get("entity_f1") is not None:
+        out += f"- **{test_metrics.get('entity_label', 'Entity')} F1:** {test_metrics['entity_f1']:.4f}\n"
+    if test_metrics.get("pair_f1") is not None:
+        out += f"- **{test_metrics.get('pair_label', 'Relation')} F1:** {test_metrics['pair_f1']:.4f}\n"
+    report = test_metrics.get("report")
+    if report:
+        # Collapsible so the per-label tables (dozens of rows on real corpora)
+        # don't dominate the card, while staying available in full.
+        out += (
+            "\n<details>\n<summary>Full classification report (strict &amp; relaxed, per label)</summary>\n\n"
+            "```\n" + str(report).strip() + "\n```\n\n</details>"
+        )
+    return out
+
+
 def _config_section(config) -> str:
     rows = []
     for field in ("max_len", "max_width", "max_types", "span_mode", "relations_layer", "triples_layer"):
@@ -139,8 +161,18 @@ def _usage_section(config) -> str:
     )
 
 
-def render_model_card(config, data_stats: Optional[Dict[str, Any]] = None, best_f1: Optional[float] = None) -> str:
-    """Render the full Markdown model card for a trained GLiNER model."""
+def render_model_card(
+    config,
+    data_stats: Optional[Dict[str, Any]] = None,
+    best_f1: Optional[float] = None,
+    test_metrics: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render the full Markdown model card for a trained GLiNER model.
+
+    ``test_metrics`` (from ``build_test_metrics``) adds a blind-test evaluation
+    section; it is filled in after training, when the held-out test results
+    exist.
+    """
     task = _task(config)
     base_model = getattr(config, "model_name", None) or "unknown"
     frontmatter = (
@@ -169,6 +201,7 @@ def render_model_card(config, data_stats: Optional[Dict[str, Any]] = None, best_
         frontmatter,
         f"{title}\n\n{_purpose(task)}",
         overview,
+        _evaluation_section(test_metrics),
         _label_schema(config, data_stats),
         _training_data_section(data_stats),
         _config_section(config),
@@ -183,8 +216,9 @@ def write_model_card(
     config,
     data_stats: Optional[Dict[str, Any]] = None,
     best_f1: Optional[float] = None,
+    test_metrics: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Write the model card to ``<save_dir>/README.md`` and return its path."""
     path = Path(save_dir) / "README.md"
-    path.write_text(render_model_card(config, data_stats, best_f1), encoding="utf-8")
+    path.write_text(render_model_card(config, data_stats, best_f1, test_metrics), encoding="utf-8")
     return path

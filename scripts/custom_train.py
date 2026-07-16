@@ -26,12 +26,13 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from gliner import GLiNER, GLiNERConfig
 from gliner.data_processing.tokenizer import WordsSplitter
 from gliner.data_processing.trigger_types import apply_derived_trigger_types
-from gliner.training.model_card import summarize_training_data
+from gliner.training.model_card import summarize_training_data, write_model_card
 from gliner.utils import load_config_as_namespace
 from gliner.training.data_utils import (
     BestModelTracker,
     blind_test_by_language,
     evaluate_and_extract_f1,
+    build_test_metrics,
     flatten_namespace,
     load_multi_dataset,
     print_blind_test,
@@ -364,11 +365,23 @@ class Trainer:
             return
 
         eval_by_language = bool(getattr(self.config, "eval_by_language", False))
+        event_mode = bool(getattr(model_for_test.config, "event_mode", False))
         if eval_by_language:
-            blind_test_by_language(model_for_test, test_records, evaluate_kwargs={})
+            f1, output = blind_test_by_language(model_for_test, test_records, evaluate_kwargs={})
         else:
             f1, output = evaluate_and_extract_f1(model_for_test, test_records)
-            print_blind_test("all", f1, output, event_mode=bool(getattr(model_for_test.config, "event_mode", False)))
+            print_blind_test("all", f1, output, event_mode=event_mode)
+
+        # Add the blind-test metrics to the saved best model's card.
+        if os.path.isdir(best_dir):
+            write_model_card(
+                best_dir,
+                model_for_test.config,
+                data_stats=data_stats,
+                best_f1=tracker.best_f1,
+                test_metrics=build_test_metrics(f1, output, event_mode),
+            )
+            print(f"[model card] Added blind-test metrics to {os.path.join(best_dir, 'README.md')}")
 
 
 def create_parser():
