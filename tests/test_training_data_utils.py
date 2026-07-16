@@ -16,6 +16,7 @@ from gliner.training.data_utils import (
     load_multi_dataset,
     print_blind_test,
     sweep_thresholds,
+    warn_if_max_types_truncates,
     window_records,
 )
 
@@ -296,6 +297,33 @@ class TestFlattenNamespace:
         flatten_namespace(cfg)
         assert not hasattr(cfg.model, "b")
         assert not hasattr(cfg.data, "c")
+
+
+class TestWarnIfMaxTypesTruncates:
+    RECORDS = [
+        {"ner": [[0, 0, "A"], [1, 1, "B"], [2, 2, "C"]], "relations": [[0, 1, "r1"], [0, 2, "r2"]]},
+    ]
+
+    def test_warns_when_entity_types_exceed_max_types(self):
+        with pytest.warns(UserWarning, match=r"3 distinct entity types"):
+            warn_if_max_types_truncates(self.RECORDS, max_types=2)
+
+    def test_warns_when_relation_types_exceed_max_types(self):
+        with pytest.warns(UserWarning, match=r"2 distinct relation types"):
+            warn_if_max_types_truncates(self.RECORDS, max_types=1)
+
+    def test_silent_when_max_types_covers_all(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning becomes an error
+            warn_if_max_types_truncates(self.RECORDS, max_types=5)
+
+    def test_silent_on_missing_inputs(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            warn_if_max_types_truncates(None, 5)
+            warn_if_max_types_truncates(self.RECORDS, None)
 
 
 class TestWindowRecords:

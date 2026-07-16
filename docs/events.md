@@ -118,6 +118,17 @@ single most safety-critical invariant in the pipeline; a misordering here
 silently trains the model on shuffled role labels while every tensor shape
 check still passes).
 
+`num_triggers` / `num_args` count **distinct span positions, not entities.**
+The model's bipartite selection (`select_span_target_embedding`) produces one
+slot per `(start, end)` span, so when several `ner` entities share a span —
+routine in real corpora with coreferent or overlapping annotations — they must
+collapse to a single trigger/argument rank. Ranking per entity instead
+overcounts `num_triggers`/`num_args`, so the gold `adj_matrix` `(B, max_T,
+max_A)` no longer matches the model's `pred_adj_matrix` and `adj_loss` crashes
+on the shape mismatch (`RuntimeError: The size of tensor a (...) must match ...`).
+`EventExtractionSpanProcessor.preprocess_example` handles this by keying its
+trigger/argument ranks on `(start, end)`.
+
 ### Deriving `trigger_types` — don't use a label-shape heuristic
 
 The converted JSONL doesn't self-describe which `ner` labels are triggers.
@@ -128,16 +139,25 @@ are bare words (`Manoeuvre`) with the same shape as some argument roles. If
 you get this wrong, `trigger_class_mask` comes out wrong, no shape check
 catches it, and the model trains with zero real event supervision.
 
-`data/_trigger_types.py` provides the dataset-agnostic derivation: since
-`relations` entries are always `[trigger_idx, arg_idx, role]`, a *sound*
-(never wrong) trigger vocabulary is the set of `ner` labels that ever
-appear as a relation **head**:
+`gliner/data_processing/trigger_types.py` provides the dataset-agnostic
+derivation (also re-exported from `data/_trigger_types.py` for the
+converters): since `relations` entries are always `[trigger_idx, arg_idx,
+role]`, a *sound* (never wrong) trigger vocabulary is the set of `ner`
+labels that ever appear as a relation **head**:
 
 ```python
-from _trigger_types import derive_trigger_types
+from gliner.data_processing.trigger_types import derive_trigger_types
 
 trigger_types = derive_trigger_types(records)
 ```
+
+**You usually don't call this yourself.** `train.py` and
+`scripts/custom_train.py` auto-derive `trigger_types` from the raw training
+records at startup (via `apply_derived_trigger_types`) whenever an
+`event_mode` config leaves `trigger_types` empty — so the shipped event
+configs can keep `trigger_types: []` and still train a live event head.
+Deriving by hand (above) is only needed when driving the processor
+directly, as in the low-level Training example below.
 
 For every converter that has both triggers and relations (WikiEvents,
 RAMS, CASIE, CMNEE, ACE2005), head and tail label sets are disjoint by
@@ -153,8 +173,11 @@ vocabulary explicitly instead of deriving it.
 
 Datasets with **no relations at all** (MAVEN, LEVEN — trigger-only, no
 argument annotations; events_biotech — synthetic trigger-per-label, no
-arguments) have nothing to derive from at all; pass the label vocabulary
-explicitly via `derive_trigger_types(records, explicit={...})`.
+arguments) have nothing to derive from at all. The training-script
+auto-derivation **raises `ValueError`** at startup for these rather than
+training a silently dead head, so set their `trigger_types` explicitly in
+the config (or, when driving the processor directly, pass the vocabulary
+via `derive_trigger_types(records, explicit={...})`).
 
 ## Training
 
@@ -395,3 +418,8 @@ specifically to avoid).
   WikiEvents text (not just "doesn't crash"): asserts total loss, `adj_loss`,
   and `rel_loss` each decrease by more than noise over 15 training steps.
   Uses `triples_layer=None` -- see "TransE ... saturate" above for why.
+- `tests/test_trigger_types.py` — `trigger_types` derivation, the
+  `apply_derived_trigger_types` wiring against both a dict (train.py) and a
+  namespace (custom_train.py) config, the `data/_trigger_types.py` re-export
+  shim, and a `train.main()` integration guard that fails if the
+  auto-derivation wiring is removed from the training script.

@@ -5,6 +5,7 @@ helpers shared between ``train.py`` and ``scripts/custom_train.py``.
 import argparse
 import json
 import random
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -86,6 +87,34 @@ def _extract_entity_types(records: List[Dict]) -> List[str]:
     """Collect the sorted set of entity type labels present across ``records``."""
     types = {ent[2] for rec in records for ent in rec.get("ner", [])}
     return sorted(types)
+
+
+def warn_if_max_types_truncates(records: Optional[List[Dict]], max_types: Optional[int]) -> None:
+    """Warn when the training data has more distinct entity/relation types than ``max_types``.
+
+    Per-example type sampling (``batch_generate_class_mappings``) pools each
+    record's gold types with in-data negatives, shuffles, and keeps the first
+    ``max_types`` -- so once that pool exceeds ``max_types`` gold types can be
+    randomly dropped from an example's label set. Negatives are drawn only from
+    in-data types, so ``total distinct types <= max_types`` guarantees no
+    truncation and ``> max_types`` is the exact condition under which it can
+    occur. For event models, dropping a trigger type removes that event's
+    supervision, so this is worth surfacing once at startup.
+    """
+    if not records or not max_types:
+        return
+    max_types = int(max_types)
+    for kind, key in (("entity", "ner"), ("relation", "relations")):
+        types = {ann[-1] for rec in records for ann in (rec.get(key) or [])}
+        total = len(types)
+        if total > max_types:
+            warnings.warn(
+                f"max_types={max_types} but the training data has {total} distinct {kind} "
+                f"types: per-example sampling can drop up to {total - max_types} of them "
+                f"(gold types included) from each example's label set. Raise max_types to "
+                f">= {total} to guarantee no gold {kind} type is dropped.",
+                stacklevel=2,
+            )
 
 
 def evaluate_and_extract_f1(model, records: List[Dict], **evaluate_kwargs) -> Tuple[float, Any]:

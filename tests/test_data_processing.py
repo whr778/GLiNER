@@ -1573,6 +1573,44 @@ class TestEventExtractionSpanProcessor:
         )
         assert not result["trigger_class_mask"].any()
 
+    def test_entities_sharing_a_span_collapse_to_one_rank(self, processor):
+        """Multiple ner entities at the same (start, end) must collapse to a
+        single trigger/argument rank. The model selects one bipartite slot per
+        span position, so per-entity ranking overcounts num_triggers/num_args
+        and desyncs the gold adj_matrix from pred_adj_matrix -- adj_loss then
+        shape-crashes (reproduced on real WikiEvents, where coreferent mentions
+        routinely put two entities on one span). trigger_types={"Attack"}."""
+        tokens = ["John", "attacked", "Paris"]
+        ner = [
+            (1, 1, "Attack"),    # trigger
+            (0, 0, "Person"),    # argument at span (0,0)
+            (0, 0, "Victim"),    # SAME span (0,0), different type -> must collapse
+            (2, 2, "Location"),  # argument at span (2,2)
+        ]
+        relations = [(0, 1, "Attacker"), (0, 3, "Place")]  # trigger -> Person(0,0), trigger -> Location(2,2)
+        classes_to_id = {"Attack": 1, "Person": 2, "Victim": 3, "Location": 4}
+        rel_classes_to_id = {"Attacker": 1, "Place": 2}
+
+        result = processor.preprocess_example(tokens, ner, classes_to_id, relations, rel_classes_to_id)
+
+        assert result["num_triggers"] == 1
+        assert result["num_args"] == 2  # (0,0) and (2,2) -- the two (0,0) entities collapse, NOT 3
+        # roles map to the collapsed arg ranks: (trigger 0 -> arg 0) and (trigger 0 -> arg 1)
+        assert {tuple(p) for p in result["rel_idx"].tolist()} == {(0, 0), (0, 1)}
+
+    def test_triggers_sharing_a_span_collapse_to_one_rank(self, mock_config, mock_tokenizer, mock_words_splitter):
+        """Two trigger-type entities on one span also collapse to one trigger rank."""
+        from gliner.data_processing.processor import EventExtractionSpanProcessor
+        processor = EventExtractionSpanProcessor(
+            mock_config, mock_tokenizer, mock_words_splitter, trigger_types={"Attack", "Bombing"}
+        )
+        tokens = ["bomb", "hit"]
+        ner = [(0, 0, "Attack"), (0, 0, "Bombing"), (1, 1, "Person")]  # two triggers on span (0,0)
+        classes_to_id = {"Attack": 1, "Bombing": 2, "Person": 3}
+        result = processor.preprocess_example(tokens, ner, classes_to_id, [], {"Role": 1})
+        assert result["num_triggers"] == 1  # (0,0) once, not 2
+        assert result["num_args"] == 1
+
     def test_no_roles_produces_empty_but_correctly_shaped_matrices(self, processor):
         """An example with entities but no relations must not crash, and
         should produce zero-filled matrices sized by num_triggers/num_args."""

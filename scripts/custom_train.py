@@ -34,6 +34,7 @@ from gliner.training.data_utils import (
     flatten_namespace,
     load_multi_dataset,
     print_blind_test,
+    warn_if_max_types_truncates,
     window_records,
 )
 
@@ -323,6 +324,7 @@ class Trainer:
         # vs. arguments; the shipped event configs leave it empty. Derive from
         # the raw (pre-windowing) records so the event head is fed triggers.
         apply_derived_trigger_types(self.config, data)
+        warn_if_max_types_truncates(data, getattr(self.config, "max_types", None))
 
         data = window_records(data, max_len=self.config.max_len)
         val_records = load_multi_dataset(getattr(self.config, "val_data", None), seed=seed)

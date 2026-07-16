@@ -2206,6 +2206,16 @@ class EventExtractionSpanProcessor(RelationExtractionSpanProcessor):
         base["relations"] = relations_sorted if relations_sorted is not None else []
         span_to_idx = {(s, e): i for i, (s, e) in enumerate(base["span_idx"].tolist())}
 
+        # Rank by distinct span position, not per entity. The model's bipartite
+        # selection (select_span_target_embedding) produces one slot per span
+        # position, so multiple ner entities sharing one (start, end) -- common
+        # in real event corpora (coreference, overlapping annotations) -- must
+        # collapse to a single trigger/argument rank. Ranking per entity instead
+        # overcounts num_triggers/num_args, so the gold adj_matrix (B, max_T,
+        # max_A) no longer matches the model's pred_adj_matrix and adj_loss
+        # crashes on the shape mismatch.
+        trigger_span_rank: Dict[tuple, int] = {}
+        arg_span_rank: Dict[tuple, int] = {}
         trigger_rank: Dict[int, int] = {}
         arg_rank: Dict[int, int] = {}
         num_tokens = base["seq_length"]
@@ -2217,9 +2227,11 @@ class EventExtractionSpanProcessor(RelationExtractionSpanProcessor):
                 if class_id is None:
                     continue
                 if label in self.trigger_types:
-                    trigger_rank[ent_idx] = len(trigger_rank)
+                    span_rank = trigger_span_rank.setdefault((start, end), len(trigger_span_rank))
+                    trigger_rank[ent_idx] = span_rank
                 else:
-                    arg_rank[ent_idx] = len(arg_rank)
+                    span_rank = arg_span_rank.setdefault((start, end), len(arg_span_rank))
+                    arg_rank[ent_idx] = span_rank
 
         role_idx_list, role_label_list = [], []
         for head_idx, tail_idx, role_type in (relations_sorted or []):
@@ -2234,8 +2246,8 @@ class EventExtractionSpanProcessor(RelationExtractionSpanProcessor):
             base["rel_idx"] = torch.zeros(0, 2, dtype=torch.long)
             base["rel_label"] = torch.zeros(0, dtype=torch.long)
 
-        base["num_triggers"] = len(trigger_rank)
-        base["num_args"] = len(arg_rank)
+        base["num_triggers"] = len(trigger_span_rank)
+        base["num_args"] = len(arg_span_rank)
         return base
 
     def create_batch_dict(self, batch, class_to_ids, id_to_classes, rel_class_to_ids, rel_id_to_classes):

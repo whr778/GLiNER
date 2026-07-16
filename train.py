@@ -15,6 +15,7 @@ from gliner.training.data_utils import (
     load_multi_dataset,
     print_blind_test,
     sweep_thresholds,
+    warn_if_max_types_truncates,
     window_records,
 )
 from gliner.utils import load_config_as_namespace, namespace_to_dict
@@ -114,6 +115,7 @@ def main(cfg_path: str):
     # per-dataset); do that here from the raw (pre-windowing) records so the
     # event head is actually fed triggers instead of silently producing none.
     apply_derived_trigger_types(model_cfg, train_dataset)
+    warn_if_max_types_truncates(train_dataset, model_cfg.get("max_types"))
 
     train_dataset = window_records(train_dataset, max_len=cfg.model.max_len, stride=window_stride)
     print(f"Training samples: {len(train_dataset)}")
