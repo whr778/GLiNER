@@ -21,10 +21,12 @@ from gliner.modeling.base import (
 )
 from gliner.modeling.utils import (
     build_entity_pairs,
+    build_trigger_argument_pairs,
     extract_prompt_features,
     extract_word_embeddings,
     extract_prompt_features_and_word_embeddings,
 )
+from gliner.modeling.multitask.relations_layers import RelationsRepLayer, BipartiteRelationsRepLayer
 
 
 class TestExtractWordEmbeddings:
@@ -633,6 +635,178 @@ class TestBuildEntityPairs:
         assert head_rep.shape[0] == B
         assert tail_rep.shape[0] == B
 
+class TestBuildTriggerArgumentPairs:
+    """Test suite for build_trigger_argument_pairs (bipartite event pairing)."""
+
+    @pytest.fixture
+    def basic_setup(self):
+        """Two triggers, three arguments, both fully valid (no padding)."""
+        B, T, A, D = 2, 2, 3, 8
+        trigger_rep = torch.randn(B, T, D)
+        trigger_mask = torch.ones(B, T, dtype=torch.long)
+        arg_rep = torch.randn(B, A, D)
+        arg_mask = torch.ones(B, A, dtype=torch.long)
+        return {
+            'trigger_rep': trigger_rep, 'trigger_mask': trigger_mask,
+            'arg_rep': arg_rep, 'arg_mask': arg_mask,
+            'B': B, 'T': T, 'A': A, 'D': D,
+        }
+
+    def test_returns_four_tensors(self, basic_setup):
+        result = build_trigger_argument_pairs(
+            basic_setup['trigger_rep'], basic_setup['trigger_mask'],
+            basic_setup['arg_rep'], basic_setup['arg_mask'],
+        )
+        assert len(result) == 4
+        pair_idx, pair_mask, head_rep, tail_rep = result
+        assert isinstance(pair_idx, torch.Tensor)
+        assert isinstance(pair_mask, torch.Tensor)
+        assert isinstance(head_rep, torch.Tensor)
+        assert isinstance(tail_rep, torch.Tensor)
+
+    def test_no_adjacency_pairs_full_cartesian(self, basic_setup):
+        """Without adj, every (trigger, argument) combination is paired -- T*A, not T*(T-1)+A*(A-1)."""
+        pair_idx, pair_mask, head_rep, tail_rep = build_trigger_argument_pairs(
+            basic_setup['trigger_rep'], basic_setup['trigger_mask'],
+            basic_setup['arg_rep'], basic_setup['arg_mask'],
+        )
+        T, A, D = basic_setup['T'], basic_setup['A'], basic_setup['D']
+
+        for b in range(basic_setup['B']):
+            valid = pair_idx[b][pair_mask[b]]
+            assert len(valid) == T * A
+            pair_set = {(p[0].item(), p[1].item()) for p in valid}
+            assert pair_set == {(t, a) for t in range(T) for a in range(A)}
+
+        assert head_rep.shape == (basic_setup['B'], T * A, D)
+        assert tail_rep.shape == (basic_setup['B'], T * A, D)
+
+    def test_no_self_pair_exclusion_needed(self, basic_setup):
+        """Unlike build_entity_pairs, index 0 can appear as both trigger and argument index --
+        trigger and argument index spaces are independent, so there is no diagonal to exclude."""
+        pair_idx, pair_mask, _, _ = build_trigger_argument_pairs(
+            basic_setup['trigger_rep'], basic_setup['trigger_mask'],
+            basic_setup['arg_rep'], basic_setup['arg_mask'],
+        )
+        valid = pair_idx[0][pair_mask[0]]
+        assert any(p[0].item() == 0 and p[1].item() == 0 for p in valid)
+
+    def test_adjacency_filters_below_threshold(self):
+        B, T, A, D = 1, 2, 2, 4
+        trigger_rep = torch.randn(B, T, D)
+        trigger_mask = torch.ones(B, T, dtype=torch.long)
+        arg_rep = torch.randn(B, A, D)
+        arg_mask = torch.ones(B, A, dtype=torch.long)
+
+        adj = torch.zeros(B, T, A)
+        adj[0, 0, 1] = 0.9  # only this pair survives threshold=0.5
+        adj[0, 1, 0] = 0.3
+
+        pair_idx, pair_mask, _, _ = build_trigger_argument_pairs(
+            trigger_rep, trigger_mask, arg_rep, arg_mask, adj=adj, threshold=0.5
+        )
+        valid = pair_idx[0][pair_mask[0]]
+        assert len(valid) == 1
+        assert (valid[0, 0].item(), valid[0, 1].item()) == (0, 1)
+
+    def test_head_tail_representations_match_pairs(self, basic_setup):
+        pair_idx, pair_mask, head_rep, tail_rep = build_trigger_argument_pairs(
+            basic_setup['trigger_rep'], basic_setup['trigger_mask'],
+            basic_setup['arg_rep'], basic_setup['arg_mask'],
+        )
+        trigger_rep, arg_rep = basic_setup['trigger_rep'], basic_setup['arg_rep']
+
+        t_idx = pair_idx[0, 0, 0].item()
+        a_idx = pair_idx[0, 0, 1].item()
+        assert torch.allclose(head_rep[0, 0], trigger_rep[0, t_idx])
+        assert torch.allclose(tail_rep[0, 0], arg_rep[0, a_idx])
+
+    def test_pads_with_minus_one(self, basic_setup):
+        pair_idx, pair_mask, _, _ = build_trigger_argument_pairs(
+            basic_setup['trigger_rep'], basic_setup['trigger_mask'],
+            basic_setup['arg_rep'], basic_setup['arg_mask'],
+        )
+        for b in range(basic_setup['B']):
+            padded = ~pair_mask[b]
+            if padded.any():
+                assert torch.all(pair_idx[b, padded] == -1)
+
+    def test_respects_per_example_valid_counts(self):
+        """Padding entries (mask=0) must be excluded from pairing, even mid-batch."""
+        B, T, A, D = 2, 3, 3, 4
+        trigger_rep = torch.randn(B, T, D)
+        trigger_mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.long)
+        arg_rep = torch.randn(B, A, D)
+        arg_mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.long)
+
+        pair_idx, pair_mask, _, _ = build_trigger_argument_pairs(
+            trigger_rep, trigger_mask, arg_rep, arg_mask
+        )
+
+        assert pair_mask[0].sum().item() == 2 * 3  # 2 valid triggers * 3 valid args
+        assert pair_mask[1].sum().item() == 1 * 2  # 1 valid trigger * 2 valid args
+
+    def test_handles_no_valid_triggers(self):
+        B, T, A, D = 1, 2, 2, 4
+        trigger_rep = torch.randn(B, T, D)
+        trigger_mask = torch.zeros(B, T, dtype=torch.long)
+        arg_rep = torch.randn(B, A, D)
+        arg_mask = torch.ones(B, A, dtype=torch.long)
+
+        pair_idx, pair_mask, head_rep, tail_rep = build_trigger_argument_pairs(
+            trigger_rep, trigger_mask, arg_rep, arg_mask
+        )
+        assert pair_idx.shape == (B, 1, 2)
+        assert torch.all(pair_idx == -1)
+        assert torch.all(pair_mask == False)
+        assert head_rep.shape == (B, 1, D)
+        assert tail_rep.shape == (B, 1, D)
+
+    def test_handles_no_pairs_above_threshold(self):
+        B, T, A, D = 1, 2, 2, 4
+        trigger_rep = torch.randn(B, T, D)
+        trigger_mask = torch.ones(B, T, dtype=torch.long)
+        arg_rep = torch.randn(B, A, D)
+        arg_mask = torch.ones(B, A, dtype=torch.long)
+        adj = torch.zeros(B, T, A) + 0.1
+
+        pair_idx, pair_mask, head_rep, tail_rep = build_trigger_argument_pairs(
+            trigger_rep, trigger_mask, arg_rep, arg_mask, adj=adj, threshold=0.5
+        )
+        assert pair_idx.shape == (B, 1, 2)
+        assert torch.all(pair_mask == False)
+
+    def test_preserves_dtype_and_device(self, basic_setup):
+        pair_idx, pair_mask, head_rep, tail_rep = build_trigger_argument_pairs(
+            basic_setup['trigger_rep'], basic_setup['trigger_mask'],
+            basic_setup['arg_rep'], basic_setup['arg_mask'],
+        )
+        device = basic_setup['trigger_rep'].device
+        dtype = basic_setup['trigger_rep'].dtype
+
+        assert pair_idx.device == device
+        assert pair_mask.device == device
+        assert head_rep.dtype == dtype
+        assert tail_rep.dtype == dtype
+
+    @pytest.mark.parametrize("threshold", [0.0, 0.5, 0.9, 1.0])
+    def test_different_thresholds(self, threshold):
+        B, T, A, D = 2, 2, 3, 4
+        trigger_rep = torch.randn(B, T, D)
+        trigger_mask = torch.ones(B, T, dtype=torch.long)
+        arg_rep = torch.randn(B, A, D)
+        arg_mask = torch.ones(B, A, dtype=torch.long)
+        adj = torch.rand(B, T, A)
+
+        pair_idx, pair_mask, head_rep, tail_rep = build_trigger_argument_pairs(
+            trigger_rep, trigger_mask, arg_rep, arg_mask, adj=adj, threshold=threshold
+        )
+        assert pair_idx.shape[0] == B
+        assert pair_mask.shape[0] == B
+        assert head_rep.shape[0] == B
+        assert tail_rep.shape[0] == B
+
+
 class TestBaseModel:
     """Test suite for BaseModel functionality."""
 
@@ -1078,6 +1252,134 @@ class TestUniEncoderSpanRelexModel:
         assert isinstance(loss, torch.Tensor)
         assert loss.ndim == 0
         assert loss.item() >= 0
+
+
+class TestUniEncoderSpanRelexModelEventMode:
+    """Test suite for UniEncoderSpanRelexModel with event_mode=True (bipartite trigger/argument)."""
+
+    @pytest.fixture
+    def mock_config(self):
+        """Fixture providing configuration for an event-extraction model."""
+        return UniEncoderSpanRelexConfig(
+            model_name='bert-base-uncased',
+            hidden_size=64,
+            dropout=0.1,
+            max_width=12,
+            span_mode='markerV0',
+            class_token_index=103,
+            has_rnn=False,
+            post_fusion_schema='',
+            embed_ent_token=True,
+            relations_layer='dot',
+            triples_layer='TransE',
+            embed_rel_token=True,
+            rel_token_index=104,
+            rel_token='<<REL>>',
+            event_mode=True,
+        )
+
+    @pytest.fixture
+    def model_inputs(self):
+        """Fixture mirroring TestUniEncoderSpanRelexModel-style inputs, plus
+        trigger_class_mask marking the first two of five classes as event types."""
+        B, L, W, C = 2, 100, 12, 5
+        max_width = 12
+
+        # class_token_index=103 / rel_token_index=104 must actually appear in
+        # input_ids for prompts_embedding/rel_prompts_embedding to have the
+        # expected column counts -- place them at fixed positions rather than
+        # relying on random input_ids to contain them by chance.
+        input_ids = torch.randint(200, 1000, (B, L))
+        input_ids[:, 0:5] = 103  # 5 entity/event-type markers -> C=5 prompt columns
+        input_ids[:, 5] = 104    # 1 relation/role marker -> C_rel=1
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': torch.ones(B, L, dtype=torch.long),
+            'words_mask': torch.randint(0, W, (B, L)),
+            'text_lengths': torch.tensor([W, W - 2]).unsqueeze(-1),
+            'span_idx': torch.randint(0, W, (B, L * max_width, 2)),
+            'span_mask': torch.randint(0, 2, (B, L * max_width)),
+            'labels': torch.zeros(B, L * max_width, C),
+            'trigger_class_mask': torch.tensor([[1, 1, 0, 0, 0]] * B, dtype=torch.bool),
+        }
+
+    def test_broadcast_class_mask_handles_3d_and_4d(self, mock_config):
+        """The (B, C) column partition must broadcast correctly whether the
+        reference tensor is (B, N, C) (flattened labels) or (B, L, K, C)
+        (scores, always 4D from the einsum in represent_spans_bipartite)."""
+        model = UniEncoderSpanRelexModel(mock_config, from_pretrained=False)
+        class_mask = torch.tensor([[1, 1, 0, 0, 0], [0, 1, 1, 0, 0]], dtype=torch.bool)
+
+        ref_3d = torch.randn(2, 7, 5)
+        mask_3d = model._broadcast_class_mask(class_mask, ref_3d)
+        assert mask_3d.shape == (2, 1, 5)
+        assert (mask_3d.expand_as(ref_3d) | ~mask_3d.expand_as(ref_3d)).all()  # broadcastable, no error
+
+        ref_4d = torch.randn(2, 3, 4, 5)
+        mask_4d = model._broadcast_class_mask(class_mask, ref_4d)
+        assert mask_4d.shape == (2, 1, 1, 5)
+
+        # Values themselves are preserved, only shape changes
+        assert torch.equal(mask_3d.squeeze(1), class_mask)
+        assert torch.equal(mask_4d.squeeze(1).squeeze(1), class_mask)
+
+    def test_relations_rep_layer_is_bipartite_when_event_mode(self, mock_config):
+        model = UniEncoderSpanRelexModel(mock_config, from_pretrained=False)
+        assert isinstance(model.relations_rep_layer, BipartiteRelationsRepLayer)
+
+    def test_relations_rep_layer_is_homogeneous_when_not_event_mode(self, mock_config):
+        mock_config.event_mode = False
+        model = UniEncoderSpanRelexModel(mock_config, from_pretrained=False)
+        assert isinstance(model.relations_rep_layer, RelationsRepLayer)
+        assert not isinstance(model.relations_rep_layer, BipartiteRelationsRepLayer)
+
+    def test_event_mode_defaults_to_false(self):
+        assert UniEncoderSpanRelexConfig(relations_layer='dot').event_mode is False
+
+    def test_event_mode_forward_without_labels(self, mock_config, model_inputs):
+        """Inference path: no labels, no gold adjacency -- exercises predicted
+        bipartite adjacency + build_trigger_argument_pairs + triples scoring."""
+        model = UniEncoderSpanRelexModel(mock_config, from_pretrained=False)
+        inputs = {k: v for k, v in model_inputs.items() if k != 'labels'}
+
+        with torch.no_grad():
+            output = model(**inputs)
+
+        assert output.loss is None
+        B = model_inputs['input_ids'].shape[0]
+        assert output.logits.shape[0] == B
+
+    def test_event_mode_forward_with_labels_backprops(self, mock_config, model_inputs):
+        """Training path: with gold labels, loss must be a finite scalar that
+        backprops cleanly through the bipartite adjacency + triples path."""
+        model = UniEncoderSpanRelexModel(mock_config, from_pretrained=False)
+
+        # Force at least one gold trigger (class 0) and one gold argument (class 2).
+        model_inputs['labels'][0, 0, 0] = 1.0
+        model_inputs['labels'][0, 1, 2] = 1.0
+        model_inputs['span_mask'][0, 0] = 1
+        model_inputs['span_mask'][0, 1] = 1
+
+        output = model(**model_inputs)
+
+        assert output.loss is not None
+        assert torch.isfinite(output.loss)
+        output.loss.backward()
+
+    def test_event_mode_off_leaves_forward_unaffected(self, mock_config, model_inputs):
+        """Sanity check that event_mode=False (default RelEx behavior) does not
+        require or use trigger_class_mask at all."""
+        mock_config.event_mode = False
+        model = UniEncoderSpanRelexModel(mock_config, from_pretrained=False)
+        inputs = {k: v for k, v in model_inputs.items() if k not in ('labels', 'trigger_class_mask')}
+
+        with torch.no_grad():
+            output = model(**inputs)
+
+        assert output.loss is None
+        assert output.trigger_spans is None
+        assert output.arg_spans is None
 
 
 class TestBiEncoderSpanModel:

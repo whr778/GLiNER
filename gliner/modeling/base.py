@@ -28,6 +28,7 @@ from torch.nn import functional as F
 from .utils import (
     build_entity_pairs,
     build_all_entity_pairs,
+    build_trigger_argument_pairs,
     extract_prompt_features,
     extract_word_embeddings,
     extract_spans_from_tokens,
@@ -41,7 +42,7 @@ from .scorers import Scorer
 from .span_rep import SpanRepLayer
 from .loss_functions import cross_entropy_loss, focal_loss_with_logits
 from .multitask.triples_layers import TriplesScoreLayer
-from .multitask.relations_layers import RelationsRepLayer
+from .multitask.relations_layers import RelationsRepLayer, BipartiteRelationsRepLayer
 
 
 class BaseModel(ABC, nn.Module):
@@ -711,6 +712,7 @@ class UniEncoderTokenModel(BaseUniEncoderModel):
         label_smoothing: float = 0.0,
         reduction: str = "sum",
         negatives: float = 1.0,
+        masking: str = "none",
         **kwargs: Any,
     ) -> torch.Tensor:
         """Compute token- or span-level classification loss.
@@ -732,12 +734,15 @@ class UniEncoderTokenModel(BaseUniEncoderModel):
             reduction: Reduction method applied to the final loss. One of
                 ``"none"``, ``"mean"``, or ``"sum"``.
             negatives: Weighting factor for negative examples.
+            masking: Masking strategy for negative sampling.
             **kwargs: Additional unused keyword arguments for API compatibility.
 
         Returns:
             A scalar tensor representing the aggregated loss value.
         """
-        all_losses = self._loss(scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives)
+        all_losses = self._loss(
+            scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives=negatives, masking=masking
+        )
 
         # Base mask: (B, W/N, C)
         mask = word_mask.unsqueeze(-1) * prompts_embedding_mask.unsqueeze(1)
@@ -1012,6 +1017,7 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
         mask_label: torch.Tensor,
         alpha: float = -1.0,
         gamma: float = 0.0,
+        prob_margin: float = 0.0,
         label_smoothing: float = 0.0,
         reduction: str = "sum",
         negatives: float = 1.0,
@@ -1027,6 +1033,7 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
             mask_label: Mask for valid spans of shape (B, L, K).
             alpha: Focal loss alpha parameter.
             gamma: Focal loss gamma parameter.
+            prob_margin: Margin for probability adjustment.
             label_smoothing: Label smoothing factor.
             reduction: Loss reduction method ('sum' or 'mean').
             negatives: Negative sampling probability.
@@ -1045,7 +1052,9 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
         scores = scores.view(BS, -1, CL)
         labels = labels.view(BS, -1, CL)
 
-        all_losses = self._loss(scores, labels, alpha, gamma, label_smoothing, negatives=negatives, masking=masking)
+        all_losses = self._loss(
+            scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives=negatives, masking=masking
+        )
 
         masked_loss = all_losses.view(batch_size, -1, num_classes) * prompts_embedding_mask.unsqueeze(1)
         all_losses = masked_loss.view(-1, num_classes)
@@ -1641,6 +1650,7 @@ class UniEncoderSpanDecoderModel(UniEncoderSpanModel):
         mask_label: torch.Tensor,
         alpha: float = -1.0,
         gamma: float = 0.0,
+        prob_margin: float = 0.0,
         label_smoothing: float = 0.0,
         reduction: str = "sum",
         negatives: float = 1.0,
@@ -1657,6 +1667,7 @@ class UniEncoderSpanDecoderModel(UniEncoderSpanModel):
             mask_label: Mask for valid spans of shape (B, L, K).
             alpha: Focal loss alpha parameter.
             gamma: Focal loss gamma parameter.
+            prob_margin: Margin for probability adjustment.
             label_smoothing: Label smoothing factor.
             reduction: Loss reduction method ('sum' or 'mean').
             negatives: Negative sampling probability.
@@ -1675,7 +1686,9 @@ class UniEncoderSpanDecoderModel(UniEncoderSpanModel):
         scores = scores.view(BS, -1, CL)
         labels = labels.view(BS, -1, CL)
 
-        all_losses = self._loss(scores, labels, alpha, gamma, label_smoothing, negatives=negatives, masking=masking)
+        all_losses = self._loss(
+            scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives=negatives, masking=masking
+        )
 
         masked_loss = all_losses.view(batch_size, -1, num_classes) * prompts_embedding_mask.unsqueeze(1)
         all_losses = masked_loss.view(-1, num_classes)
@@ -2113,9 +2126,14 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
 
         if config.relations_layer is not None:
             if config.relations_layer != "none":
-                self.relations_rep_layer = RelationsRepLayer(
-                    in_dim=config.hidden_size, relation_mode=config.relations_layer
-                )
+                if getattr(config, "event_mode", False):
+                    self.relations_rep_layer = BipartiteRelationsRepLayer(
+                        in_dim=config.hidden_size, relation_mode=config.relations_layer
+                    )
+                else:
+                    self.relations_rep_layer = RelationsRepLayer(
+                        in_dim=config.hidden_size, relation_mode=config.relations_layer
+                    )
 
             if config.triples_layer is not None:
                 self.triples_score_layer = TriplesScoreLayer(config.triples_layer)
@@ -2190,6 +2208,26 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
 
         return target_rep, target_mask, target_span_idx
 
+    @staticmethod
+    def _broadcast_class_mask(class_mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """Reshape a (B, C) boolean/float class mask to broadcast against `ref`.
+
+        `ref` may be (B, C), (B, N, C), or (B, L, K, C) -- labels in
+        particular are tolerated in either flattened or unflattened form
+        elsewhere in this class (see loss()'s `.view(BS, -1, CL)`), so this
+        inserts however many singleton dims are needed instead of assuming a
+        fixed rank.
+
+        Args:
+            class_mask: Mask of shape (B, C).
+            ref: Tensor whose shape (except the class dim) to broadcast against.
+
+        Returns:
+            Boolean mask reshaped to broadcast against `ref`.
+        """
+        extra_dims = ref.dim() - 2
+        return class_mask.bool().view(class_mask.shape[0], *([1] * extra_dims), class_mask.shape[-1])
+
     def select_target_embedding(
         self, representations: Optional[torch.FloatTensor] = None, rep_mask: Optional[torch.LongTensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2253,6 +2291,70 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             target_span_rep, target_span_mask, entity_spans = None, None, None
         return scores, target_span_rep, target_span_mask, entity_spans
 
+    def represent_spans_bipartite(
+        self,
+        words_embeddings,
+        words_mask,
+        prompts_embeddings,
+        trigger_class_mask: torch.Tensor,
+        span_idx: Optional[torch.Tensor] = None,
+        span_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        threshold: float = 0.5,
+    ):
+        """Select trigger spans and candidate argument spans as two separate sets.
+
+        Event counterpart to represent_spans: entity-type labels for a given
+        example are a mix of event types (triggers) and regular entity types
+        (argument fillers), decided per-example since GLiNER's label space is
+        zero-shot. Rather than selecting one merged span set and recovering
+        which spans are triggers afterwards, this calls the existing
+        select_span_target_embedding twice on the *same* scores/labels with
+        the non-relevant class columns masked out, so trigger and argument
+        selection each reuse the untouched, already-tested selection logic
+        (including its train-vs-inference branching) unchanged.
+
+        Args:
+            words_embeddings, words_mask, prompts_embeddings, span_idx,
+                span_mask, labels, threshold: Same as represent_spans.
+            trigger_class_mask: Boolean/float mask of shape (B, C) where 1
+                marks a class column (in `prompts_embeddings`/`scores`) as an
+                event-type (trigger) label; 0 marks a regular entity-type
+                (argument filler) label. Supplied per-batch by the collator,
+                since which labels are event types varies per example.
+
+        Returns:
+            Tuple of (scores, trigger_rep, trigger_mask, trigger_spans,
+            arg_rep, arg_mask, arg_spans).
+        """
+        span_idx = span_idx * span_mask.unsqueeze(-1).long()
+        span_rep = self.span_rep_layer(words_embeddings, span_idx)
+        scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embeddings)  # always (B, L, K, C)
+
+        # labels may arrive pre-flattened as (B, L*K, C) instead of (B, L, K, C)
+        # -- self.loss() tolerates both via .view(), so mirror that flexibility
+        # here instead of assuming a fixed rank.
+        trig_col_scores = self._broadcast_class_mask(trigger_class_mask, scores)
+        arg_col_scores = ~trig_col_scores
+        scores_trigger = scores.masked_fill(~trig_col_scores, float("-inf"))
+        scores_arg = scores.masked_fill(~arg_col_scores, float("-inf"))
+
+        if labels is not None:
+            trig_col_labels = self._broadcast_class_mask(trigger_class_mask, labels)
+            arg_col_labels = ~trig_col_labels
+            labels_trigger = labels.masked_fill(~trig_col_labels, 0)
+            labels_arg = labels.masked_fill(~arg_col_labels, 0)
+        else:
+            labels_trigger = labels_arg = None
+
+        trigger_rep, trigger_mask, trigger_spans = self.select_span_target_embedding(
+            span_rep, scores_trigger, span_mask, labels_trigger, threshold, span_idx=span_idx
+        )
+        arg_rep, arg_mask, arg_spans = self.select_span_target_embedding(
+            span_rep, scores_arg, span_mask, labels_arg, threshold, span_idx=span_idx
+        )
+        return scores, trigger_rep, trigger_mask, trigger_spans, arg_rep, arg_mask, arg_spans
+
     def forward(
         self,
         input_ids: Optional[torch.FloatTensor] = None,
@@ -2270,6 +2372,7 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         rel_matrix: Optional[torch.FloatTensor] = None,
         threshold: Optional[float] = 0.5,
         adjacency_threshold: Optional[float] = 0.5,
+        trigger_class_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> GLiNERRelexOutput:
         """Forward pass through the relation extraction model.
@@ -2286,15 +2389,24 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             span_idx: Span indices of shape (B, L*K, 2).
             span_mask: Mask for valid spans of shape (B, L, K).
             labels: Ground truth entity labels of shape (B, L, K, C).
-            adj_matrix: Ground truth adjacency matrix of shape (B, E, E).
+            adj_matrix: Ground truth adjacency matrix. Shape (B, E, E) normally,
+                or (B, T, A) bipartite trigger/argument adjacency when
+                config.event_mode is True and trigger_class_mask is given.
             rel_matrix: Ground truth relation labels of shape (B, N, C_rel).
             threshold: Confidence threshold for entity selection.
             adjacency_threshold: Threshold for relation adjacency.
+            trigger_class_mask: Event mode only. Boolean/float mask of shape
+                (B, C) marking which class columns are event-type (trigger)
+                labels vs regular entity-type (argument filler) labels.
+                Required (together with config.event_mode=True) to take the
+                bipartite trigger/argument path; otherwise the model behaves
+                exactly as before.
             **kwargs: Additional arguments.
 
         Returns:
             GLiNERRelexOutput containing entity and relation predictions.
         """
+        event_mode = getattr(self.config, "event_mode", False) and trigger_class_mask is not None
         encoder_kwargs = {
             key: kwargs[key]
             for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths")
@@ -2355,9 +2467,19 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         prompts_embedding = self.prompt_rep_layer(prompts_embedding)
         batch_size, _, embed_dim = prompts_embedding.shape
 
-        scores, target_span_rep, target_span_mask, entity_spans = self.represent_spans(
-            words_embedding, mask, prompts_embedding, span_idx, span_mask, labels, threshold
-        )
+        trigger_rep = trigger_mask = trigger_spans = arg_rep = arg_mask = arg_spans = None
+        if event_mode:
+            scores, trigger_rep, trigger_mask, trigger_spans, arg_rep, arg_mask, arg_spans = (
+                self.represent_spans_bipartite(
+                    words_embedding, mask, prompts_embedding, trigger_class_mask,
+                    span_idx, span_mask, labels, threshold,
+                )
+            )
+            target_span_rep, target_span_mask, entity_spans = None, None, None
+        else:
+            scores, target_span_rep, target_span_mask, entity_spans = self.represent_spans(
+                words_embedding, mask, prompts_embedding, span_idx, span_mask, labels, threshold
+            )
 
         pair_idx, pair_mask, pair_scores = None, None, None
         rel_prompts_embedding, rel_prompts_embedding_mask = None, None
@@ -2371,7 +2493,10 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
 
         if has_relex:
             if hasattr(self, "relations_rep_layer"):
-                pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
+                if event_mode:
+                    pred_adj_matrix = self.relations_rep_layer(trigger_rep, arg_rep, trigger_mask, arg_mask)
+                else:
+                    pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
 
             if use_precomputed and getattr(self, "precomputed_rel_prompts", None) is not None:
                 rel_prompts_embedding, rel_prompts_embedding_mask = self.lookup_precomputed_prompts(
@@ -2388,10 +2513,22 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                     self.config.embed_rel_token,
                 )
 
-            B, _, D = target_span_rep.shape
+            B = trigger_rep.shape[0] if event_mode else target_span_rep.shape[0]
+            D = trigger_rep.shape[-1] if event_mode else target_span_rep.shape[-1]
             C_rel = rel_prompts_embedding.size(1)
 
-            if hasattr(self, "relations_rep_layer"):
+            if event_mode:
+                adj_for_selection = adj_matrix if (labels is not None and adj_matrix is not None) else pred_adj_matrix
+                if hasattr(self, "relations_rep_layer"):
+                    pair_idx, pair_mask, head_rep_selected, tail_rep_selected = build_trigger_argument_pairs(
+                        trigger_rep, trigger_mask, arg_rep, arg_mask,
+                        adj=adj_for_selection, threshold=adjacency_threshold,
+                    )
+                else:
+                    pair_idx, pair_mask, head_rep_selected, tail_rep_selected = build_trigger_argument_pairs(
+                        trigger_rep, trigger_mask, arg_rep, arg_mask
+                    )
+            elif hasattr(self, "relations_rep_layer"):
                 adj_for_selection = adj_matrix if (labels is not None and adj_matrix is not None) else pred_adj_matrix
                 pair_idx, pair_mask, head_rep_selected, tail_rep_selected = build_entity_pairs(
                     adj_for_selection, target_span_rep, threshold=adjacency_threshold
@@ -2462,7 +2599,10 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                 span_loss = loss * self.config.span_loss_coef if loss is not None else 0.0
 
                 if hasattr(self, "relations_rep_layer") and adj_matrix is not None:
-                    adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
+                    if event_mode:
+                        adj_mask = trigger_mask.float().unsqueeze(2) * arg_mask.float().unsqueeze(1)
+                    else:
+                        adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
                     adj_loss = self.adj_loss(pred_adj_matrix, adj_matrix, adj_mask, **rel_kwargs)
 
                     loss = (
@@ -2491,6 +2631,8 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             rel_prompts_embedding=rel_prompts_embedding,
             rel_prompts_embedding_mask=rel_prompts_embedding_mask,
             entity_spans=None if is_training else entity_spans,
+            trigger_spans=None if (is_training or not event_mode) else trigger_spans,
+            arg_spans=None if (is_training or not event_mode) else arg_spans,
         )
         return output
 
@@ -2659,6 +2801,7 @@ class UniEncoderTokenRelexModel(UniEncoderSpanRelexModel):
         label_smoothing: float = 0.0,
         reduction: str = "sum",
         negatives: float = 1.0,
+        masking: str = "none",
         **kwargs: Any,
     ) -> torch.Tensor:
         """Compute token classification loss.
@@ -2674,12 +2817,15 @@ class UniEncoderTokenRelexModel(UniEncoderSpanRelexModel):
             label_smoothing: Label smoothing factor.
             reduction: Loss reduction method ('sum' or 'mean').
             negatives: Negative sampling probability.
+            masking: Masking strategy for negative sampling.
             **kwargs: Additional arguments.
 
         Returns:
             Scalar loss tensor.
         """
-        all_losses = self._loss(scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives)
+        all_losses = self._loss(
+            scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives=negatives, masking=masking
+        )
 
         masked_loss = all_losses * (word_mask.unsqueeze(-1) * prompts_embedding_mask.unsqueeze(1)).unsqueeze(-1)
 

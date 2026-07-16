@@ -10,6 +10,18 @@ __pycache__/
 
 #data
 data.json
+data/*.json
+data/*.jsonl
+data/cmnee
+data/DocEE
+data/DocEE-en
+data/LEVEN
+data/maven
+data/RAMS_1.0c
+data/*.gz
+data/*.zip
+data/.DS_store
+gliner_logs/
 
 #logs
 logs/
@@ -181,3 +193,5 @@ poetry.toml
 pyrightconfig.json
 
 .vscode
+# macOS
+.DS_Store

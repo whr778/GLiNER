@@ -98,6 +98,12 @@ class GLiNERRelexOutput(GLiNERBaseOutput):
             relation type prompts/labels. Shape: [batch_size, num_relation_types, hidden_size].
         rel_prompts_embedding_mask (Optional[torch.LongTensor]): Attention mask
             for relation prompt embeddings. Shape: [batch_size, num_relation_types].
+        trigger_spans (Optional[torch.LongTensor]): Event mode only. Trigger
+            span boundaries; rel_idx[..., 0] indexes into this set rather
+            than into entity_spans. Shape: [batch_size, num_triggers, 2].
+        arg_spans (Optional[torch.LongTensor]): Event mode only. Candidate
+            argument span boundaries; rel_idx[..., 1] indexes into this set
+            rather than into entity_spans. Shape: [batch_size, num_args, 2].
     """
 
     rel_idx: Optional[torch.LongTensor] = None
@@ -106,3 +112,5 @@ class GLiNERRelexOutput(GLiNERBaseOutput):
     entity_spans: Optional[torch.LongTensor] = None
     rel_prompts_embedding: Optional[torch.FloatTensor] = None
     rel_prompts_embedding_mask: Optional[torch.LongTensor] = None
+    trigger_spans: Optional[torch.LongTensor] = None
+    arg_spans: Optional[torch.LongTensor] = None

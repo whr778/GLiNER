@@ -1,0 +1,161 @@
+# Aggregate NER model -- trains on every converted dataset's entity signal
+# (NER-only, NER+RE, and event datasets alike; "relations"/event-role fields
+# are simply ignored by this plain NER architecture, not noise).
+#
+# Every source now has a real (or, where none existed upstream,
+# synthetically 80/10/10 split) train/val/test -- see data/run_all_converters.sh
+# and the individual configs/<dataset>.yaml files this was assembled from.
+# Convert each source first: entries pointing at files that don't exist yet
+# will fail to load.
+model:
+  # Model Configuration
+  model_name: microsoft/deberta-v3-small # Hugging Face model
+  labels_encoder: null  # Set to model name for bi-encoder architecture
+  name: "aggregate NER"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  fuse_layers: false
+  post_fusion_schema: null  # e.g., "l2l-l2t-t2t"
+  span_mode: markerV0  # Options: token_level | markerV0
+  max_types: 100
+  max_len: 512
+  max_neg_type_ratio: 1
+
+data:
+  # Directory Paths
+  root_dir: gliner_logs/aggregate_ner
+  train_data:
+    - "data/gliner_multilingual.train.jsonl"
+    - "data/knowledgator_gliner.train.jsonl"
+    - "data/finer_ord.train.jsonl"
+    - "data/kaznerd.train.jsonl"
+    - "data/bc5cdr.train.jsonl"
+    - "data/biomed_ner.train.jsonl"
+    - "data/stockmark_ner.train.jsonl"
+    - "data/pubmed_abstracts_ner.train.jsonl"
+    - "data/klue_ner.train.jsonl"
+    - "data/nuner.train.jsonl"
+    - "data/paraloq_json.train.jsonl"
+    - "data/pile_ner_definition.train.jsonl"
+    - "data/text2json.train.jsonl"
+    - "data/scierc.train.jsonl"
+    - "data/biored.train.jsonl"
+    - "data/bio_ner_relations.train.jsonl"
+    - "data/docred.train.jsonl"
+    - "data/redocred.train.jsonl"
+    - "data/klue_re.train.jsonl"
+    - "data/sentence_rex.train.jsonl"
+    - "data/wikievents.train.jsonl"
+    - "data/rams.train.jsonl"
+    - "data/maven.train.jsonl"
+    - "data/leven.train.jsonl"
+    - "data/casie.train.jsonl"
+    - "data/cmnee.train.jsonl"
+    - "data/docee.train.jsonl"
+    - "data/events_biotech.train.jsonl"
+    - "data/ace2005.train.jsonl"
+  val_data:
+    - "data/gliner_multilingual.val.jsonl"
+    - "data/knowledgator_gliner.val.jsonl"
+    - "data/finer_ord.val.jsonl"
+    - "data/kaznerd.val.jsonl"
+    - "data/bc5cdr.val.jsonl"
+    - "data/biomed_ner.val.jsonl"
+    - "data/stockmark_ner.val.jsonl"
+    - "data/pubmed_abstracts_ner.val.jsonl"
+    - "data/klue_ner.val.jsonl"
+    - "data/nuner.val.jsonl"
+    - "data/paraloq_json.val.jsonl"
+    - "data/pile_ner_definition.val.jsonl"
+    - "data/text2json.val.jsonl"
+    - "data/scierc.val.jsonl"
+    - "data/biored.val.jsonl"
+    - "data/bio_ner_relations.val.jsonl"
+    - "data/docred.val.jsonl"
+    - "data/redocred.val.jsonl"
+    - "data/klue_re.val.jsonl"
+    - "data/sentence_rex.val.jsonl"
+    - "data/wikievents.val.jsonl"
+    - "data/rams.val.jsonl"
+    - "data/maven.val.jsonl"
+    - "data/leven.val.jsonl"
+    - "data/casie.val.jsonl"
+    - "data/cmnee.val.jsonl"
+    - "data/docee.val.jsonl"
+    - "data/events_biotech.val.jsonl"
+    - "data/ace2005.val.jsonl"
+  test_data:
+    - "data/gliner_multilingual.test.jsonl"
+    - "data/knowledgator_gliner.test.jsonl"
+    - "data/finer_ord.test.jsonl"
+    - "data/kaznerd.test.jsonl"
+    - "data/bc5cdr.test.jsonl"
+    - "data/biomed_ner.test.jsonl"
+    - "data/stockmark_ner.test.jsonl"
+    - "data/pubmed_abstracts_ner.test.jsonl"
+    - "data/klue_ner.test.jsonl"
+    - "data/nuner.test.jsonl"
+    - "data/paraloq_json.test.jsonl"
+    - "data/pile_ner_definition.test.jsonl"
+    - "data/text2json.test.jsonl"
+    - "data/scierc.test.jsonl"
+    - "data/biored.test.jsonl"
+    - "data/bio_ner_relations.test.jsonl"
+    - "data/redocred.test.jsonl"
+    - "data/klue_re.test.jsonl"
+    - "data/sentence_rex.test.jsonl"
+    - "data/wikievents.test.jsonl"
+    - "data/rams.test.jsonl"
+    - "data/casie.test.jsonl"
+    - "data/cmnee.test.jsonl"
+    - "data/docee.test.jsonl"
+    - "data/events_biotech.test.jsonl"
+    - "data/ace2005.test.jsonl"
+
+training:
+  # Pretrained Model Path
+  prev_path: null  # Use null for training from scratch, or path/repo for fine-tuning
+
+  # Training Parameters
+  num_epochs: 15  # Evaluated at the end of every epoch, not by step.
+  early_stopping_patience: 3  # Stop after 3 evals with no F1 improvement.
+  train_batch_size: 8
+  gradient_accumulation_steps: 1  # Effective batch size = train_batch_size x this. Raise to grow the effective batch without more memory.
+  window_stride: null  # Overlap (word tokens) between sliding-window chunks for documents
+    # longer than max_len. null = auto (max_len // 4 = 128 here). Lower = more overlap/windows.
+  eval_by_language: false  # If true, blind test prints a per-language breakdown, then all combined
+  threshold: 0.5  # Decision threshold for entity/relation/adjacency decoding.
+  threshold_sweep: false  # If true (default 5-point grid) or a list of candidate
+    # thresholds (e.g. [0.2, 0.3, 0.4]), calibrate against val_data after training
+    # and use the best-scoring threshold for the blind test instead of threshold above.
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"  # Options: linear, cosine, constant
+
+  # Loss Function Configuration
+  loss_alpha: 0.75
+  loss_gamma: 0
+  loss_prob_margin: 0
+  label_smoothing: 0
+  loss_reduction: "sum"
+  negatives: 1.0
+  masking: 'none'
+
+  # Learning Rate and Weight Decay
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.1
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+
+  # Checkpoint Management
+  save_total_limit: 3  # Maximum number of checkpoints to save
+
+  # Advanced Training Settings
+  size_sup: -1
+  shuffle_types: true
+  random_drop: true
+
+  freeze_components: null  # Examples: ['text_encoder']

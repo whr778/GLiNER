@@ -1193,6 +1193,174 @@ class SpanRelexDecoder(BaseSpanDecoder):
         return spans, relations
 
 
+class EventSpanDecoder(SpanRelexDecoder):
+    """Decoder for event extraction (bipartite trigger/argument RelEx models).
+
+    Entity/trigger spans decode exactly like SpanRelexDecoder's, since
+    model_output.logits still covers every class column (trigger and
+    argument types alike) -- only role decoding differs. In event_mode,
+    rel_idx[..., 0] indexes trigger_spans and rel_idx[..., 1] indexes
+    arg_spans (two separate lists from represent_spans_bipartite), not one
+    merged entity_spans list, so pair_idx must be mapped back to decoded
+    spans via two independent lookups instead of SpanRelexDecoder's one.
+    """
+
+    def _decode_event_roles(
+        self,
+        spans: List[List[tuple]],
+        rel_idx: Optional[torch.Tensor],
+        rel_logits: Optional[torch.Tensor],
+        rel_mask: Optional[torch.Tensor],
+        rel_id_to_classes: Union[Dict[int, str], List[Dict[int, str]]],
+        threshold: Union[float, List[float]],
+        batch_size: int,
+        trigger_spans: Optional[torch.Tensor] = None,
+        arg_spans: Optional[torch.Tensor] = None,
+    ) -> List[List[tuple]]:
+        """Decode (trigger, role, argument) triples between detected spans.
+
+        Args:
+            spans: Decoded entity/trigger spans per sample (from
+                BaseSpanDecoder.decode), each as (start, end, type, score).
+            rel_idx: Shape (batch_size, num_pairs, 2); [...,0] indexes
+                trigger_spans, [...,1] indexes arg_spans.
+            rel_logits: Shape (batch_size, num_pairs, num_role_classes).
+            rel_mask: Optional shape (batch_size, num_pairs).
+            rel_id_to_classes: Mapping from role class IDs to role names
+                (1-indexed; 0 reserved).
+            threshold: Minimum confidence (after sigmoid) for a role.
+            batch_size: Number of samples in the batch.
+            trigger_spans: Shape (B, T, 2) trigger span boundaries, as
+                returned by GLiNERRelexOutput.trigger_spans.
+            arg_spans: Shape (B, A, 2) candidate argument span boundaries,
+                as returned by GLiNERRelexOutput.arg_spans.
+
+        Returns:
+            List of role lists, one per sample. Each entry is a tuple
+            (trigger_idx, role_label, arg_idx, score), where trigger_idx and
+            arg_idx index into that sample's decoded `spans` list (the same
+            list entity/trigger spans were decoded into -- both trigger and
+            argument spans are looked up against it, since it already
+            contains every positively-scored span across all class columns).
+        """
+        if rel_idx is None or rel_logits is None:
+            return [[] for _ in range(batch_size)]
+
+        if rel_mask is None:
+            rel_mask = torch.ones(rel_idx[..., 0].shape, dtype=torch.bool, device=rel_idx.device)
+
+        rel_probs = torch.sigmoid(rel_logits)
+
+        rel_idx_cpu = rel_idx.tolist()
+        rel_mask_cpu = rel_mask.tolist()
+        rel_probs_cpu = rel_probs.tolist()
+
+        trigger_idx_mappings = self._build_entity_span_to_decoded_idx(spans, trigger_spans, batch_size)
+        arg_idx_mappings = self._build_entity_span_to_decoded_idx(spans, arg_spans, batch_size)
+
+        events = [[] for _ in range(batch_size)]
+        thresholds = _expand_batch_param(threshold, batch_size, "relation_threshold")
+
+        for i in range(batch_size):
+            rel_id_to_class_i = rel_id_to_classes[i] if isinstance(rel_id_to_classes, list) else rel_id_to_classes
+            trig_map = trigger_idx_mappings[i]
+            arg_map = arg_idx_mappings[i]
+            threshold_i = thresholds[i]
+
+            for j in range(len(rel_idx_cpu[i])):
+                if not rel_mask_cpu[i][j]:
+                    continue
+
+                model_trigger_idx = rel_idx_cpu[i][j][0]
+                model_arg_idx = rel_idx_cpu[i][j][1]
+                if model_trigger_idx < 0 or model_arg_idx < 0:
+                    continue
+
+                if trig_map is None or arg_map is None:
+                    continue
+                trigger_span_idx = trig_map.get(model_trigger_idx)
+                arg_span_idx = arg_map.get(model_arg_idx)
+                if trigger_span_idx is None or arg_span_idx is None:
+                    continue
+
+                for c, prob in enumerate(rel_probs_cpu[i][j]):
+                    if prob <= threshold_i:
+                        continue
+                    if (c + 1) not in rel_id_to_class_i:
+                        continue
+                    role_label = rel_id_to_class_i[c + 1]
+                    events[i].append((trigger_span_idx, role_label, arg_span_idx, prob))
+
+        return events
+
+    def decode(
+        self,
+        tokens: List[List[str]],
+        id_to_classes: Union[Dict[int, str], List[Dict[int, str]]],
+        model_output,
+        rel_idx: Optional[torch.Tensor] = None,
+        rel_logits: Optional[torch.Tensor] = None,
+        rel_mask: Optional[torch.Tensor] = None,
+        flat_ner: bool = False,
+        threshold: float = 0.5,
+        relation_threshold: float = 0.5,
+        multi_label: bool = False,
+        return_class_probs: bool = False,
+        rel_id_to_classes: Optional[Union[Dict[int, str], List[Dict[int, str]]]] = None,
+        trigger_spans: Optional[torch.Tensor] = None,
+        arg_spans: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[List[List[tuple]], List[List[tuple]]]:
+        """Decode model output to extract entity/trigger spans and event roles.
+
+        Deliberately calls BaseSpanDecoder.decode directly (not
+        SpanRelexDecoder.decode, which assumes one merged entity_spans list)
+        for the span-decoding half, then decodes roles via
+        _decode_event_roles using the two separate trigger_spans/arg_spans
+        lists event_mode produces.
+
+        Args:
+            tokens, id_to_classes, model_output, rel_idx, rel_logits,
+                rel_mask, flat_ner, threshold, relation_threshold,
+                multi_label, return_class_probs, rel_id_to_classes: Same as
+                SpanRelexDecoder.decode.
+            trigger_spans: Shape (B, T, 2), from GLiNERRelexOutput.trigger_spans.
+            arg_spans: Shape (B, A, 2), from GLiNERRelexOutput.arg_spans.
+            **kwargs: Additional keyword arguments passed to span decoding.
+
+        Returns:
+            Tuple of (spans, events), where events is a list (per sample) of
+            (trigger_idx, role_label, arg_idx, score) tuples.
+        """
+        spans = BaseSpanDecoder.decode(
+            self,
+            tokens=tokens,
+            id_to_classes=id_to_classes,
+            model_output=model_output,
+            flat_ner=flat_ner,
+            threshold=threshold,
+            multi_label=multi_label,
+            return_class_probs=return_class_probs,
+            **kwargs,
+        )
+
+        events = [[] for _ in range(len(tokens))]
+        if rel_id_to_classes is not None:
+            events = self._decode_event_roles(
+                spans=spans,
+                rel_idx=rel_idx,
+                rel_logits=rel_logits,
+                rel_mask=rel_mask,
+                rel_id_to_classes=rel_id_to_classes,
+                threshold=relation_threshold,
+                batch_size=len(tokens),
+                trigger_spans=trigger_spans,
+                arg_spans=arg_spans,
+            )
+
+        return spans, events
+
+
 class TokenDecoder(BaseDecoder):
     """
     Token-based decoder for sequence labeling tasks.

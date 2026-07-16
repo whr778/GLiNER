@@ -11,6 +11,7 @@ from .processor import (
     UniEncoderTokenProcessor,
     UniEncoderSpanDecoderProcessor,
     RelationExtractionSpanProcessor,
+    EventExtractionSpanProcessor,
 )
 
 
@@ -495,6 +496,23 @@ class RelationExtractionSpanDataCollator(BaseSpanCollator):
             Dictionary with None values removed.
         """
         return {k: v for k, v in batch_dict.items() if v is not None}
+
+
+class EventExtractionSpanDataCollator(RelationExtractionSpanDataCollator):
+    """Data collator for EventExtractionSpanProcessor.
+
+    No new logic beyond RelationExtractionSpanDataCollator: raw examples are
+    still collated as entities ('ner', triggers included) + relations (event
+    roles) via collate_raw_batch, and trigger_class_mask flows through
+    automatically because collate_function -> collate_fn ->
+    tokenize_and_prepare_labels resolves polymorphically to
+    EventExtractionSpanProcessor's override, which is where trigger vs.
+    argument entities and event roles actually get split out.
+
+    Required Processor: EventExtractionSpanProcessor
+    """
+
+    pass
 
 
 class RelationExtractionTokenDataCollator(RelationExtractionSpanDataCollator):

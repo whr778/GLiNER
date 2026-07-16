@@ -2145,6 +2145,263 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
         return tokenized_input
 
 
+class EventExtractionSpanProcessor(RelationExtractionSpanProcessor):
+    """Processor for event extraction: trigger + role-labeled argument spans.
+
+    Reuses RelationExtractionSpanProcessor's entity/span machinery -- triggers
+    are entities labeled with event-type classes, arguments are entities
+    labeled with regular entity-type classes, and event roles are relations
+    restricted to (trigger, argument) pairs. Only entity ordering and label
+    construction differ: entities are split into two independently-ranked
+    subsets (trigger, argument) instead of one combined ordering, matching
+    the two independent selection passes represent_spans_bipartite performs
+    at the model level (see gliner/modeling/base.py).
+
+    trigger_types is fixed per dataset (event schemas define a static set of
+    event-type labels), unlike the zero-shot per-batch sampling of *which*
+    labels appear -- so it is set once at construction, not threaded through
+    per-example like classes_to_id.
+    """
+
+    def __init__(self, config, tokenizer, words_splitter, trigger_types):
+        """Initialize the event extraction processor.
+
+        Args:
+            config: Configuration object.
+            tokenizer: Transformer tokenizer.
+            words_splitter: Word-level tokenizer/splitter.
+            trigger_types: Set/list of entity-type label strings that denote
+                event types (triggers); every other label is treated as a
+                regular argument-filler entity type.
+        """
+        super().__init__(config, tokenizer, words_splitter)
+        self.trigger_types = set(trigger_types)
+
+    def preprocess_example(self, tokens, ner, classes_to_id, relations, rel_classes_to_id):
+        """Like RelationExtractionSpanProcessor.preprocess_example, but splits
+        compact entity indices into independent trigger/argument sub-rankings
+        (each in ascending (start, end) order) and remaps relations (event
+        roles) to (trigger_rank, arg_rank) pairs in those sub-rankings.
+
+        rel_idx/rel_label are repurposed to carry (trigger_rank, arg_rank)
+        pairs and role class ids respectively -- same shape/dtype as the
+        base class, so create_batch_dict needs no override for them.
+
+        Returns:
+            Same dict as preprocess_example, plus 'num_triggers'/'num_args'
+            (entity counts per subset, needed since span_label alone cannot
+            distinguish the split without redundant per-example class lookups).
+        """
+        base = super().preprocess_example(tokens, ner, classes_to_id, [], rel_classes_to_id)
+
+        ner_sorted, relations_sorted = self.sort_entities_and_relations(ner, relations)
+        # super().preprocess_example() was deliberately called with relations=[]
+        # above (its rel_idx/rel_label pair encoding doesn't apply to the
+        # trigger/argument split events use), which left base["relations"]
+        # empty -- restore the real, sorted ground-truth roles here so
+        # BaseRelexEvaluator.get_ground_truth (which reads this field, indexed
+        # against base["entities"] == ner_sorted) sees them. Training is
+        # unaffected: label construction below uses rel_idx/rel_label, not
+        # this field.
+        base["relations"] = relations_sorted if relations_sorted is not None else []
+        span_to_idx = {(s, e): i for i, (s, e) in enumerate(base["span_idx"].tolist())}
+
+        trigger_rank: Dict[int, int] = {}
+        arg_rank: Dict[int, int] = {}
+        num_tokens = base["seq_length"]
+        if ner_sorted is not None:
+            for ent_idx, (start, end, label) in enumerate(ner_sorted):
+                if (start, end) not in span_to_idx or end >= num_tokens:
+                    continue
+                class_id = classes_to_id.get(label)
+                if class_id is None:
+                    continue
+                if label in self.trigger_types:
+                    trigger_rank[ent_idx] = len(trigger_rank)
+                else:
+                    arg_rank[ent_idx] = len(arg_rank)
+
+        role_idx_list, role_label_list = [], []
+        for head_idx, tail_idx, role_type in (relations_sorted or []):
+            if head_idx in trigger_rank and tail_idx in arg_rank and role_type in rel_classes_to_id:
+                role_idx_list.append([trigger_rank[head_idx], arg_rank[tail_idx]])
+                role_label_list.append(rel_classes_to_id[role_type])
+
+        if role_idx_list:
+            base["rel_idx"] = torch.LongTensor(role_idx_list)
+            base["rel_label"] = torch.LongTensor(role_label_list)
+        else:
+            base["rel_idx"] = torch.zeros(0, 2, dtype=torch.long)
+            base["rel_label"] = torch.zeros(0, dtype=torch.long)
+
+        base["num_triggers"] = len(trigger_rank)
+        base["num_args"] = len(arg_rank)
+        return base
+
+    def create_batch_dict(self, batch, class_to_ids, id_to_classes, rel_class_to_ids, rel_id_to_classes):
+        """Like RelationExtractionSpanProcessor.create_batch_dict, plus
+        num_triggers/num_args (needed by create_event_labels) and
+        trigger_class_mask (needed by the model's event_mode forward path)."""
+        result = super().create_batch_dict(batch, class_to_ids, id_to_classes, rel_class_to_ids, rel_id_to_classes)
+
+        result["num_triggers"] = [el["num_triggers"] for el in batch]
+        result["num_args"] = [el["num_args"] for el in batch]
+
+        id_to_classes_list = id_to_classes if isinstance(id_to_classes, list) else [id_to_classes] * len(batch)
+        # create_labels() (which would give an exact C) runs later, in
+        # tokenize_and_prepare_labels -- size from id_to_classes instead.
+        max_C = max((max(idc.keys(), default=0) for idc in id_to_classes_list), default=0)
+        trigger_class_mask = torch.zeros(len(batch), max_C, dtype=torch.bool)
+        for i, idc in enumerate(id_to_classes_list):
+            for class_id, label in idc.items():
+                if label in self.trigger_types:
+                    trigger_class_mask[i, class_id - 1] = True
+        result["trigger_class_mask"] = trigger_class_mask
+
+        return result
+
+    def create_event_labels(self, batch, add_random_negatives=True, negative_ratio=(1.0, 10.0)):
+        """Build bipartite (trigger, argument) adjacency + role labels.
+
+        Event counterpart to create_relation_labels: instead of one (B,E,E)
+        adjacency over a single entity ordering, builds (B,T,A) adjacency
+        over two independently-ranked subsets, with the row-major (trigger,
+        argument) pair order matching build_trigger_argument_pairs' own
+        `for t in T: for a in A` iteration exactly (see
+        gliner/modeling/utils.py) -- so pair k in rel_matrix always
+        corresponds to the k-th (trigger, argument) pair the model builds
+        from adj_matrix at train time.
+
+        Args:
+            batch: Collated batch dict (from create_batch_dict), with
+                num_triggers/num_args/rel_idx/rel_label as produced by
+                preprocess_example above.
+            add_random_negatives: If True, sample additional (trigger, arg)
+                pairs with no gold role as negatives, alongside gold pairs.
+            negative_ratio: Ratio of negative to positive pairs, or a
+                (min, max) range to sample per example.
+
+        Returns:
+            Tuple of (adj_matrix, rel_matrix):
+                - adj_matrix: shape (B, max_T, max_A).
+                - rel_matrix: multi-hot role labels, shape (B, max_pairs, num_role_classes).
+        """
+        B = len(batch["num_triggers"])
+        num_triggers = batch["num_triggers"]
+        num_args = batch["num_args"]
+        # Not floored to >= 1: the model's own trigger/arg selection
+        # (select_target_embedding in gliner/modeling/base.py) produces a
+        # genuinely zero-width dimension when nothing is selected across the
+        # whole batch (e.g. every example's trigger types got excluded by
+        # max_types truncation) -- padding the label side to >= 1 here while
+        # the model side stays at 0 is a shape mismatch that crashes adj_loss.
+        max_T = max(num_triggers, default=0)
+        max_A = max(num_args, default=0)
+
+        rel_class_to_ids = batch["rel_class_to_ids"]
+        if isinstance(rel_class_to_ids, list):
+            C = max((len(r) for r in rel_class_to_ids), default=0)
+        else:
+            C = len(rel_class_to_ids) if rel_class_to_ids else 0
+
+        if C == 0:
+            return torch.zeros(B, max_T, max_A, dtype=torch.float), torch.zeros(B, 1, 1, dtype=torch.float)
+
+        adj_matrix = torch.zeros(B, max_T, max_A, dtype=torch.float)
+
+        all_pairs_info = []
+        max_total_pairs = 0
+
+        for i in range(B):
+            T, A = num_triggers[i], num_args[i]
+            role_idx_i = batch["rel_idx"][i].tolist()
+            role_label_i = batch["rel_label"][i].tolist()
+
+            pair_to_roles: Dict[tuple, List[int]] = {}
+            positive_pairs = set()
+
+            for k in range(len(role_label_i)):
+                if role_label_i[k] > 0:
+                    t_idx, a_idx = role_idx_i[k]
+                    if t_idx < T and a_idx < A:
+                        pair_key = (t_idx, a_idx)
+                        positive_pairs.add(pair_key)
+                        pair_to_roles.setdefault(pair_key, []).append(role_label_i[k])
+
+            negative_pairs = set()
+            num_positives = len(positive_pairs)
+            if isinstance(negative_ratio, (tuple, list)):
+                ratio = random.uniform(negative_ratio[0], negative_ratio[1])
+            else:
+                ratio = negative_ratio
+            target_negatives = max(1, int(num_positives * ratio))
+
+            if add_random_negatives and T > 0 and A > 0 and len(negative_pairs) < target_negatives:
+                attempts = 0
+                max_attempts = target_negatives * 10
+                while len(negative_pairs) < target_negatives and attempts < max_attempts:
+                    attempts += 1
+                    t_idx = random.randint(0, T - 1)
+                    a_idx = random.randint(0, A - 1)
+                    pair = (t_idx, a_idx)
+                    if pair in positive_pairs or pair in negative_pairs:
+                        continue
+                    negative_pairs.add(pair)
+
+            all_pairs = sorted(list(positive_pairs) + list(negative_pairs))
+            pair_info = [(pair, pair in positive_pairs, pair_to_roles.get(pair, [])) for pair in all_pairs]
+
+            all_pairs_info.append(pair_info)
+            max_total_pairs = max(max_total_pairs, len(all_pairs))
+
+        max_total_pairs = max(max_total_pairs, 1)
+        rel_matrix = torch.zeros(B, max_total_pairs, C, dtype=torch.float)
+
+        for i in range(B):
+            T, A = num_triggers[i], num_args[i]
+            pair_info = all_pairs_info[i]
+            adj = torch.zeros(max(T, 1), max(A, 1))
+
+            for pair_pos, (pair, is_positive, roles) in enumerate(pair_info):
+                t_idx, a_idx = pair
+                adj[t_idx, a_idx] = 1.0
+                if is_positive:
+                    for class_id in roles:
+                        rel_matrix[i, pair_pos, class_id - 1] = 1.0
+
+            adj_matrix[i, :T, :A] = adj[:T, :A]
+
+        return adj_matrix, rel_matrix
+
+    def tokenize_and_prepare_labels(self, batch, prepare_labels, *args, **kwargs):
+        """Tokenize inputs and prepare labels for event extraction.
+
+        Args:
+            batch: Batch dictionary with tokens, entities, relations (roles),
+                class mappings, and trigger_class_mask (from create_batch_dict).
+            prepare_labels: Whether to prepare labels.
+            *args, **kwargs: Passed through to tokenize_inputs.
+
+        Returns:
+            Dictionary containing tokenized inputs, entity/trigger labels,
+            trigger_class_mask, event adjacency matrix, and role labels.
+        """
+        tokenized_input = self.tokenize_inputs(
+            batch["tokens"], batch["classes_to_id"], blank=None, relations=batch["rel_class_to_ids"]
+        )
+        tokenized_input["trigger_class_mask"] = batch["trigger_class_mask"]
+
+        if prepare_labels:
+            labels = self.create_labels(batch)
+            tokenized_input["labels"] = labels
+
+            adj_matrix, rel_matrix = self.create_event_labels(batch)
+            tokenized_input["adj_matrix"] = adj_matrix
+            tokenized_input["rel_matrix"] = rel_matrix
+
+        return tokenized_input
+
+
 class RelationExtractionTokenProcessor(UniEncoderTokenProcessor, RelationExtractionSpanProcessor):
     """Processor for joint entity and relation extraction using token-level NER.
 

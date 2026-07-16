@@ -3,7 +3,15 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 
-from .utils import _prf_divide, flatten_for_eval, extract_tp_actual_correct
+from .utils import (
+    _prf_divide,
+    build_classification_report,
+    compute_relaxed_prf,
+    extract_tp_actual_correct,
+    flatten_for_eval,
+    relaxed_label_counts,
+    strict_label_counts,
+)
 
 
 class BaseEvaluator(ABC):
@@ -109,15 +117,24 @@ class BaseEvaluator(ABC):
 
     @torch.no_grad()
     def evaluate(self):
-        """Evaluate predictions against ground truth.
+        """Evaluate predictions against ground truth, strict and relaxed.
 
-        Transforms data using transform_data() and computes precision, recall,
-        and F1 score using micro-averaging.
+        Strict matching requires an exact span match (GLiNER's original
+        behavior, unchanged). Relaxed matching additionally accepts a
+        same-label prediction whose span merely overlaps the gold span,
+        via a two-pass greedy match (exact spans first, then overlapping
+        ones) so relaxed recall/precision can never fall below strict's.
+        Both regimes also get a per-label classification report with
+        micro and macro averages.
 
         Returns:
             Tuple of (output_str, f1) where:
-            - output_str: Formatted string with P, R, F1 percentages
-            - f1: F1 score as a float
+            - output_str: Strict/relaxed summary lines plus a per-label
+              classification report (precision, recall, F1, support, with
+              micro and macro avg rows) for each regime
+            - f1: The strict micro F1 score as a float (unchanged from
+              before -- this is what best-model tracking and early
+              stopping key on)
 
         Note:
             This method disables gradient computation with @torch.no_grad()
@@ -125,7 +142,17 @@ class BaseEvaluator(ABC):
         """
         all_true_typed, all_outs_typed = self.transform_data()
         precision, recall, f1 = self.compute_prf(all_true_typed, all_outs_typed).values()
-        output_str = f"P: {precision:.2%}\tR: {recall:.2%}\tF1: {f1:.2%}\n"
+        r_precision, r_recall, r_f1 = compute_relaxed_prf(all_true_typed, all_outs_typed).values()
+
+        strict_tp, strict_fp, strict_fn = strict_label_counts(all_true_typed, all_outs_typed)
+        relaxed_tp, relaxed_fp, relaxed_fn = relaxed_label_counts(all_true_typed, all_outs_typed)
+
+        output_str = (
+            f"Strict  - P: {precision:.2%}\tR: {recall:.2%}\tF1: {f1:.2%}\n"
+            f"Relaxed - P: {r_precision:.2%}\tR: {r_recall:.2%}\tF1: {r_f1:.2%}\n"
+            f"\nStrict classification report:\n{build_classification_report(strict_tp, strict_fp, strict_fn)}\n"
+            f"\nRelaxed classification report:\n{build_classification_report(relaxed_tp, relaxed_fp, relaxed_fn)}\n"
+        )
         return output_str, f1
 
 
@@ -251,7 +278,9 @@ class BaseRelexEvaluator(BaseEvaluator):
             t = rel[2]
             h_ent = ents[h]
             t_ent = ents[t]
-            all_rels.append([lab, (h_ent[0], h_ent[1], t_ent[0], t_ent[1])])
+            h_bounds = (h_ent.start, h_ent.end) if hasattr(h_ent, "start") else (h_ent[0], h_ent[1])
+            t_bounds = (t_ent.start, t_ent.end) if hasattr(t_ent, "start") else (t_ent[0], t_ent[1])
+            all_rels.append([lab, h_bounds + t_bounds])
         return all_rels
 
     def transform_data(self):

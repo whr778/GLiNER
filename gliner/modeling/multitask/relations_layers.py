@@ -404,3 +404,200 @@ class RelationsRepLayer(nn.Module):
             entity i to entity j in batch b.
         """
         return self.relation_rep_layer(X, *args, mask=mask, **kwargs)
+
+
+def _apply_bipartite_mask(
+    A: torch.Tensor, trigger_mask: Optional[torch.Tensor], arg_mask: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Zero out bipartite adjacency entries where either endpoint is masked.
+
+    Args:
+        A: Bipartite adjacency matrix of shape (B, T, A).
+        trigger_mask: Optional mask of shape (B, T) where 1 indicates a valid trigger.
+        arg_mask: Optional mask of shape (B, A) where 1 indicates a valid argument.
+
+    Returns:
+        Masked adjacency matrix of shape (B, T, A).
+    """
+    if trigger_mask is None and arg_mask is None:
+        return A
+    t = trigger_mask.float().unsqueeze(2) if trigger_mask is not None else 1.0
+    a = arg_mask.float().unsqueeze(1) if arg_mask is not None else 1.0
+    return A * t * a
+
+
+def bipartite_dot_product_adjacency(
+    trigger_rep: torch.Tensor,
+    arg_rep: torch.Tensor,
+    trigger_mask: Optional[torch.Tensor] = None,
+    arg_mask: Optional[torch.Tensor] = None,
+    normalize: bool = False,
+) -> torch.Tensor:
+    """Compute bipartite adjacency using dot-product (cosine) similarity.
+
+    Cross-set counterpart to dot_product_adjacency: scores every
+    (trigger, argument) pair instead of every pair within one node set.
+
+    Args:
+        trigger_rep: Trigger embeddings of shape (B, T, D).
+        arg_rep: Candidate argument embeddings of shape (B, A, D).
+        trigger_mask: Optional mask of shape (B, T) indicating valid triggers.
+        arg_mask: Optional mask of shape (B, A) indicating valid arguments.
+        normalize: If True, L2-normalize embeddings before computing similarity
+            (results in cosine similarity). Defaults to False.
+
+    Returns:
+        Adjacency matrix of shape (B, T, A) with values in (0, 1).
+    """
+    if normalize:
+        trigger_n = F.normalize(trigger_rep, p=2, dim=-1)
+        arg_n = F.normalize(arg_rep, p=2, dim=-1)
+    else:
+        trigger_n, arg_n = trigger_rep, arg_rep
+    A = torch.bmm(trigger_n, arg_n.transpose(1, 2))  # (B, T, A)
+    A = torch.sigmoid(A)
+    return _apply_bipartite_mask(A, trigger_mask, arg_mask)
+
+
+class BipartiteMLPDecoder(nn.Module):
+    """MLP-based bipartite adjacency decoder using concatenated (trigger, argument) pairs.
+
+    Cross-set counterpart to MLPDecoder: concatenates every trigger embedding
+    with every argument embedding and scores edge existence via an MLP.
+
+    Args:
+        in_dim: Input embedding dimension.
+        hidden_dim: Hidden layer dimension for the MLP.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(2 * in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+
+    def forward(
+        self,
+        trigger_rep: torch.Tensor,
+        arg_rep: torch.Tensor,
+        trigger_mask: Optional[torch.Tensor] = None,
+        arg_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute bipartite adjacency using MLP on concatenated trigger/argument pairs.
+
+        Args:
+            trigger_rep: Trigger embeddings of shape (B, T, D).
+            arg_rep: Candidate argument embeddings of shape (B, A, D).
+            trigger_mask: Optional mask of shape (B, T).
+            arg_mask: Optional mask of shape (B, A).
+
+        Returns:
+            Adjacency matrix of shape (B, T, A) with values in (0, 1).
+        """
+        B, T, D = trigger_rep.shape
+        Am = arg_rep.shape[1]
+        Xi = trigger_rep.unsqueeze(2).expand(B, T, Am, D)
+        Xj = arg_rep.unsqueeze(1).expand(B, T, Am, D)
+        A = torch.sigmoid(self.mlp(torch.cat([Xi, Xj], -1)).squeeze(-1))
+        return _apply_bipartite_mask(A, trigger_mask, arg_mask)
+
+
+class BipartiteBilinearDecoder(nn.Module):
+    """Bilinear decoder for bipartite adjacency prediction.
+
+    Cross-set counterpart to BilinearDecoder: projects trigger and argument
+    embeddings to a shared latent space and scores edges as the sigmoid of
+    their bilinear product.
+
+    Args:
+        in_dim: Input embedding dimension.
+        latent_dim: Latent projection dimension.
+    """
+
+    def __init__(self, in_dim: int, latent_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, latent_dim)
+
+    def forward(
+        self,
+        trigger_rep: torch.Tensor,
+        arg_rep: torch.Tensor,
+        trigger_mask: Optional[torch.Tensor] = None,
+        arg_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute bipartite adjacency using shared bilinear projection.
+
+        Args:
+            trigger_rep: Trigger embeddings of shape (B, T, D).
+            arg_rep: Candidate argument embeddings of shape (B, A, D).
+            trigger_mask: Optional mask of shape (B, T).
+            arg_mask: Optional mask of shape (B, A).
+
+        Returns:
+            Adjacency matrix of shape (B, T, A) with values in (0, 1).
+        """
+        Zt = self.proj(trigger_rep)
+        Za = self.proj(arg_rep)
+        A = torch.sigmoid(torch.bmm(Zt, Za.transpose(1, 2)))
+        return _apply_bipartite_mask(A, trigger_mask, arg_mask)
+
+
+class BipartiteRelationsRepLayer(nn.Module):
+    """Unified wrapper for bipartite (trigger, argument) adjacency computation.
+
+    Event counterpart to RelationsRepLayer: instead of scoring adjacency
+    within one homogeneous node set, scores adjacency between two separate
+    sets (triggers and candidate argument fillers). Only modes with a
+    well-defined cross-set generalization are supported -- 'gcn'/'gat' from
+    RelationsRepLayer require message-passing over one graph and are not
+    included here.
+
+    Args:
+        in_dim: Input embedding dimension.
+        relation_mode: One of: 'dot', 'mlp', 'bilinear'.
+        **kwargs: Method-specific arguments (hidden_dim, latent_dim).
+
+    Raises:
+        ValueError: If relation_mode is not one of the supported methods.
+    """
+
+    def __init__(self, in_dim: int, relation_mode: str, **kwargs: Any):
+        super().__init__()
+        m = relation_mode.lower()
+
+        if m == "dot":
+
+            class _Dot(nn.Module):
+                def forward(self, trigger_rep, arg_rep, trigger_mask=None, arg_mask=None):
+                    return bipartite_dot_product_adjacency(trigger_rep, arg_rep, trigger_mask, arg_mask)
+
+            self.relation_rep_layer = _Dot()
+
+        elif m == "mlp":
+            self.relation_rep_layer = BipartiteMLPDecoder(in_dim, kwargs.get("hidden_dim", in_dim))
+
+        elif m == "bilinear":
+            self.relation_rep_layer = BipartiteBilinearDecoder(in_dim, kwargs.get("latent_dim", in_dim))
+
+        else:
+            raise ValueError(f"Unknown bipartite relation mode: {relation_mode}")
+
+    def forward(
+        self,
+        trigger_rep: torch.Tensor,
+        arg_rep: torch.Tensor,
+        trigger_mask: Optional[torch.Tensor] = None,
+        arg_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute bipartite adjacency matrix from trigger and argument embeddings.
+
+        Args:
+            trigger_rep: Trigger embeddings of shape (B, T, D).
+            arg_rep: Candidate argument embeddings of shape (B, A, D).
+            trigger_mask: Optional mask of shape (B, T).
+            arg_mask: Optional mask of shape (B, A).
+
+        Returns:
+            Adjacency matrix of shape (B, T, A) with values in [0, 1].
+            Entries A[b, i, j] represent the predicted edge weight from
+            trigger i to candidate argument j in batch b.
+        """
+        return self.relation_rep_layer(trigger_rep, arg_rep, trigger_mask=trigger_mask, arg_mask=arg_mask)

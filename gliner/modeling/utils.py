@@ -353,6 +353,90 @@ def build_all_entity_pairs(
     return pair_idx, pair_mask, head_rep, tail_rep
 
 
+def build_trigger_argument_pairs(
+    trigger_rep: torch.Tensor,
+    trigger_mask: torch.Tensor,
+    arg_rep: torch.Tensor,
+    arg_mask: torch.Tensor,
+    adj: Optional[torch.Tensor] = None,
+    threshold: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build trigger-argument pairs for event extraction.
+
+    Bipartite counterpart to build_entity_pairs/build_all_entity_pairs: triggers
+    and arguments come from two separately-selected span sets (see
+    represent_spans_bipartite), so pairs are always (trigger, argument) with
+    no self-pair exclusion needed and no O(E^2) pairing over unrelated entity
+    types.
+
+    Args:
+        trigger_rep: Trigger span embeddings. Shape: (B, T, D)
+        trigger_mask: Mask for valid triggers. Shape: (B, T)
+        arg_rep: Candidate argument span embeddings. Shape: (B, A, D)
+        arg_mask: Mask for valid arguments. Shape: (B, A)
+        adj: Optional bipartite adjacency scores/probabilities of shape
+            (B, T, A). If given, only pairs with adj[b, i, j] > threshold are
+            kept (mirrors build_entity_pairs). If None, every valid
+            trigger/argument combination is paired (mirrors build_all_entity_pairs).
+        threshold: Minimum adjacency score to keep a pair when `adj` is given.
+
+    Returns:
+        Tuple containing:
+            - pair_idx: (trigger, argument) index pairs. Shape: (B, max_pairs, 2)
+              Values index into trigger_rep / arg_rep respectively, or -1 for padding.
+            - pair_mask: Mask for valid pairs. Shape: (B, max_pairs)
+            - head_rep: Trigger embeddings for each pair. Shape: (B, max_pairs, D)
+            - tail_rep: Argument embeddings for each pair. Shape: (B, max_pairs, D)
+    """
+    B, T, D = trigger_rep.shape
+    A = arg_rep.shape[1]
+    device = trigger_rep.device
+
+    trigger_counts = trigger_mask.long().sum(dim=1)
+    arg_counts = arg_mask.long().sum(dim=1)
+
+    batch_pair_lists: list[torch.Tensor] = []
+    for b in range(B):
+        t = trigger_counts[b].item()
+        a = arg_counts[b].item()
+        if t == 0 or a == 0:
+            batch_pair_lists.append(torch.zeros(0, 2, dtype=torch.long, device=device))
+            continue
+
+        t_idx = torch.arange(t, device=device)
+        a_idx = torch.arange(a, device=device)
+        rows = t_idx.repeat_interleave(a)
+        cols = a_idx.repeat(t)
+
+        if adj is not None:
+            sel = adj[b, rows, cols] > threshold
+            rows, cols = rows[sel], cols[sel]
+
+        batch_pair_lists.append(torch.stack([rows, cols], dim=-1))
+
+    N = max(p.shape[0] for p in batch_pair_lists) if batch_pair_lists else 0
+
+    if N == 0:
+        pair_idx = torch.full((B, 1, 2), -1, dtype=torch.long, device=device)
+        pair_mask = torch.zeros((B, 1), dtype=torch.bool, device=device)
+        head_rep = tail_rep = torch.zeros((B, 1, D), dtype=trigger_rep.dtype, device=device)
+        return pair_idx, pair_mask, head_rep, tail_rep
+
+    pair_idx = torch.full((B, N, 2), -1, dtype=torch.long, device=device)
+    pair_mask = torch.zeros((B, N), dtype=torch.bool, device=device)
+
+    for b, pairs in enumerate(batch_pair_lists):
+        m = pairs.shape[0]
+        pair_idx[b, :m] = pairs
+        pair_mask[b, :m] = True
+
+    batch_idx = torch.arange(B, device=device).unsqueeze(1)
+    head_rep = trigger_rep[batch_idx, pair_idx[..., 0].clamp_min(0)]
+    tail_rep = arg_rep[batch_idx, pair_idx[..., 1].clamp_min(0)]
+
+    return pair_idx, pair_mask, head_rep, tail_rep
+
+
 def extract_spans_from_tokens(
     scores: torch.Tensor,
     labels: Optional[torch.Tensor] = None,

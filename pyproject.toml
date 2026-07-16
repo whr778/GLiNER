@@ -58,6 +58,12 @@ tokenizers = [
     "stanza"
 ]
 training = ["accelerate"]
+data = [
+    "datasets",
+    "evaluate>=0.4.6",
+    "langdetect>=1.0.9",
+    "scikit-learn>=1.7.2",
+]
 stanza = [
     "stanza",
     "langdetect"

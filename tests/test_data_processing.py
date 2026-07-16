@@ -1422,5 +1422,179 @@ class TestRelationExtractionSpanProcessor:
         assert 'labels' in result
         assert 'rel_matrix' in result
 
+
+class TestEventExtractionSpanProcessor:
+    """Test suite for EventExtractionSpanProcessor.
+
+    The critical property under test is *alignment*: the (trigger, argument)
+    pair order produced by create_event_labels' adj_matrix (row-major, "for t
+    in T: for a in A") must match the row order of rel_matrix exactly, since
+    that is the same iteration order build_trigger_argument_pairs uses at
+    train time (gliner/modeling/utils.py) when it reads gold adj_matrix as
+    adj_for_selection. A shape-correct-but-misordered matrix would pass a
+    naive shape check while silently training the model on garbage role
+    labels, so these tests check *values at specific known positions*, not
+    just shapes.
+    """
+
+    @pytest.fixture
+    def processor(self, mock_config, mock_tokenizer, mock_words_splitter):
+        from gliner.data_processing.processor import EventExtractionSpanProcessor
+        return EventExtractionSpanProcessor(
+            mock_config, mock_tokenizer, mock_words_splitter, trigger_types={"Attack"}
+        )
+
+    def test_preprocess_example_splits_trigger_and_argument_ranks(self, processor):
+        """Entities must be independently ranked within their own subset, in
+        ascending (start, end) order -- not by raw input order."""
+        tokens = ["John", "attacked", "Paris", "yesterday"]
+        # Deliberately out-of-span-order and with the trigger listed first,
+        # to prove sorting (not input order) determines the ranks.
+        ner = [
+            (2, 2, "Location"),  # raw idx 0 -- "Paris", argument
+            (1, 1, "Attack"),    # raw idx 1 -- "attacked", trigger
+            (0, 0, "Person"),    # raw idx 2 -- "John", argument
+        ]
+        relations = [
+            (1, 0, "Place"),     # attacked -> Paris
+            (1, 2, "Attacker"),  # attacked -> John
+        ]
+        classes_to_id = {"Location": 1, "Attack": 2, "Person": 3}
+        rel_classes_to_id = {"Place": 1, "Attacker": 2}
+
+        result = processor.preprocess_example(tokens, ner, classes_to_id, relations, rel_classes_to_id)
+
+        assert result["num_triggers"] == 1
+        assert result["num_args"] == 2
+
+        # After (start,end)-sort: John(0,0) arg-rank 0, attacked(1,1) trigger-rank 0, Paris(2,2) arg-rank 1.
+        # So (attacked->John) = (trigger 0, arg 0) and (attacked->Paris) = (trigger 0, arg 1).
+        pairs = {tuple(p) for p in result["rel_idx"].tolist()}
+        assert pairs == {(0, 0), (0, 1)}
+
+    def test_preprocess_example_preserves_ground_truth_relations_for_scoring(self, processor):
+        """result["relations"] feeds BaseRelexEvaluator.get_ground_truth at
+        eval time (indexed against result["entities"]), separately from the
+        rel_idx/rel_label trigger/arg-rank encoding used for training labels.
+        A prior bug passed relations=[] to the base preprocess_example and
+        never restored it, so gold event roles never reached the evaluator
+        (eval always reported "no true sample" / recall pinned at 0)."""
+        tokens = ["John", "attacked", "Paris", "yesterday"]
+        ner = [(2, 2, "Location"), (1, 1, "Attack"), (0, 0, "Person")]
+        relations = [(1, 0, "Place"), (1, 2, "Attacker")]
+        classes_to_id = {"Location": 1, "Attack": 2, "Person": 3}
+        rel_classes_to_id = {"Place": 1, "Attacker": 2}
+
+        result = processor.preprocess_example(tokens, ner, classes_to_id, relations, rel_classes_to_id)
+
+        assert len(result["relations"]) == 2
+        # entities sorted by (start, end): John(0,0) idx0, attacked(1,1) idx1, Paris(2,2) idx2.
+        entities = result["entities"]
+        for head_idx, tail_idx, rel_type in result["relations"]:
+            assert entities[head_idx][2] == "Attack"
+            assert rel_type in ("Place", "Attacker")
+
+    def test_adj_and_rel_matrix_pair_order_matches_row_major_iteration(self, processor):
+        """The k-th row of rel_matrix must correspond to the k-th (t, a) pair
+        that a row-major `for t in T: for a in A` scan of adj_matrix would
+        visit -- the exact order build_trigger_argument_pairs uses."""
+        tokens = ["John", "attacked", "Paris", "yesterday"]
+        ner = [(2, 2, "Location"), (1, 1, "Attack"), (0, 0, "Person")]
+        relations = [(1, 0, "Place"), (1, 2, "Attacker")]
+        classes_to_id = {"Location": 1, "Attack": 2, "Person": 3}
+        rel_classes_to_id = {"Place": 1, "Attacker": 2}
+
+        example = processor.preprocess_example(tokens, ner, classes_to_id, relations, rel_classes_to_id)
+        batch = {
+            "num_triggers": [example["num_triggers"]],
+            "num_args": [example["num_args"]],
+            "rel_idx": [example["rel_idx"]],
+            "rel_label": [example["rel_label"]],
+            "rel_class_to_ids": [rel_classes_to_id],
+        }
+
+        adj_matrix, rel_matrix = processor.create_event_labels(batch, add_random_negatives=False)
+
+        assert adj_matrix.shape == (1, 1, 2)  # (B, max_T=1, max_A=2)
+        assert adj_matrix[0, 0, 0].item() == 1.0  # trigger 0 <-> arg 0 (John/Attacker)
+        assert adj_matrix[0, 0, 1].item() == 1.0  # trigger 0 <-> arg 1 (Paris/Place)
+
+        # Row-major scan of adj_matrix (matching build_trigger_argument_pairs):
+        # visits (t=0,a=0) then (t=0,a=1) -- so rel_matrix row 0 must be the
+        # John/Attacker role and row 1 must be the Paris/Place role.
+        attacker_id = rel_classes_to_id["Attacker"]
+        place_id = rel_classes_to_id["Place"]
+        assert rel_matrix[0, 0, attacker_id - 1].item() == 1.0
+        assert rel_matrix[0, 0, place_id - 1].item() == 0.0
+        assert rel_matrix[0, 1, place_id - 1].item() == 1.0
+        assert rel_matrix[0, 1, attacker_id - 1].item() == 0.0
+
+    def test_trigger_class_mask_marks_only_trigger_columns(self, processor):
+        """create_batch_dict's trigger_class_mask must mark exactly the
+        columns whose label is in trigger_types, per-example."""
+        batch = [
+            {
+                "tokens": ["word"], "span_idx": torch.tensor([[0, 0]]), "span_label": torch.tensor([1]),
+                "rel_idx": torch.zeros(0, 2, dtype=torch.long), "rel_label": torch.zeros(0, dtype=torch.long),
+                "seq_length": 1, "entities": [], "relations": [], "num_triggers": 0, "num_args": 1,
+            },
+        ]
+        class_to_ids = [{"Location": 1, "Attack": 2, "Person": 3}]
+        id_to_classes = [{1: "Location", 2: "Attack", 3: "Person"}]
+        rel_class_to_ids = [{"Place": 1}]
+        rel_id_to_classes = [{1: "Place"}]
+
+        result = processor.create_batch_dict(batch, class_to_ids, id_to_classes, rel_class_to_ids, rel_id_to_classes)
+
+        assert result["trigger_class_mask"].shape == (1, 3)
+        assert result["trigger_class_mask"][0].tolist() == [False, True, False]  # only "Attack" (class id 2)
+
+    def test_empty_trigger_types_gives_all_false_mask(self, mock_config, mock_tokenizer, mock_words_splitter):
+        """Regression for the silently-dead event head: with no trigger_types
+        (the shipped event-config default), NO column is marked a trigger, so
+        trigger_class_mask is all-False. The model then masks every trigger
+        score to -inf, selects zero triggers, and decodes zero events while NER
+        still trains. The training scripts derive trigger_types to prevent this
+        (see gliner/data_processing/trigger_types.py)."""
+        from gliner.data_processing.processor import EventExtractionSpanProcessor
+        processor = EventExtractionSpanProcessor(
+            mock_config, mock_tokenizer, mock_words_splitter, trigger_types=set()
+        )
+        batch = [
+            {
+                "tokens": ["word"], "span_idx": torch.tensor([[0, 0]]), "span_label": torch.tensor([1]),
+                "rel_idx": torch.zeros(0, 2, dtype=torch.long), "rel_label": torch.zeros(0, dtype=torch.long),
+                "seq_length": 1, "entities": [], "relations": [], "num_triggers": 0, "num_args": 1,
+            },
+        ]
+        result = processor.create_batch_dict(
+            batch, [{"Location": 1, "Attack": 2, "Person": 3}], [{1: "Location", 2: "Attack", 3: "Person"}],
+            [{"Place": 1}], [{1: "Place"}],
+        )
+        assert not result["trigger_class_mask"].any()
+
+    def test_no_roles_produces_empty_but_correctly_shaped_matrices(self, processor):
+        """An example with entities but no relations must not crash, and
+        should produce zero-filled matrices sized by num_triggers/num_args."""
+        tokens = ["Paris", "exists"]
+        ner = [(0, 0, "Location")]
+        classes_to_id = {"Location": 1}
+        rel_classes_to_id = {"Place": 1}
+
+        example = processor.preprocess_example(tokens, ner, classes_to_id, [], rel_classes_to_id)
+        assert example["num_triggers"] == 0
+        assert example["num_args"] == 1
+
+        batch = {
+            "num_triggers": [0], "num_args": [1],
+            "rel_idx": [example["rel_idx"]], "rel_label": [example["rel_label"]],
+            "rel_class_to_ids": [rel_classes_to_id],
+        }
+        adj_matrix, rel_matrix = processor.create_event_labels(batch, add_random_negatives=False)
+
+        assert torch.all(adj_matrix == 0.0)
+        assert torch.all(rel_matrix == 0.0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

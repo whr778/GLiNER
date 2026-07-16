@@ -1,8 +1,6 @@
 import argparse
-import json
 import os
 import re
-import random
 from tqdm import tqdm
 
 from transformers import (
@@ -22,16 +20,22 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
-    ALL_LAYERNORM_LAYERS,
 )
-from transformers import AutoTokenizer
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 from gliner import GLiNER, GLiNERConfig
-from gliner.data_processing import SpanProcessor, TokenProcessor, SpanBiEncoderProcessor, TokenBiEncoderProcessor
 from gliner.data_processing.tokenizer import WordsSplitter
-from gliner.data_processing.collator import DataCollatorWithPadding, DataCollator
+from gliner.data_processing.trigger_types import apply_derived_trigger_types
 from gliner.utils import load_config_as_namespace
-from gliner.evaluation import get_for_all_path
+from gliner.training.data_utils import (
+    BestModelTracker,
+    blind_test_by_language,
+    evaluate_and_extract_f1,
+    flatten_namespace,
+    load_multi_dataset,
+    print_blind_test,
+    window_records,
+)
 
 
 def save_top_k_checkpoints(model: GLiNER, save_path: str, checkpoint: int, top_k: int = 5):
@@ -79,14 +83,8 @@ class Trainer:
 
         self.device = device
 
-        self.model_config = GLiNERConfig(**vars(config))
-
-        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        
-        if config.labels_encoder is None:
-            self.model_config.class_token_index=len(tokenizer)
-            tokenizer.add_tokens([self.model_config.ent_token, self.model_config.sep_token])
-            self.model_config.vocab_size = len(tokenizer)
+        gliner_class = GLiNER._get_gliner_class(GLiNERConfig(**vars(config)))
+        self.model_config = gliner_class.config_class(**vars(config))
 
         self.allow_distributed = allow_distributed
 
@@ -172,17 +170,9 @@ class Trainer:
             model = GLiNER.from_pretrained(self.config.prev_path).to(device)
             model.config = self.model_config
         else:
-            model = GLiNER(self.model_config).to(device)
-            if self.config.labels_encoder is None:
-                model.resize_token_embeddings([self.model_config.ent_token, self.model_config.sep_token], 
-                                    set_class_token_index = False,
-                                    add_tokens_to_tokenizer=False)
+            model = GLiNER.from_config(vars(self.config)).to(device)
         if rank is not None:
             model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
-            if self.config.labels_encoder is None:
-                model.module.resize_token_embeddings([self.model_config.ent_token, self.model_config.sep_token], 
-                                set_class_token_index = False,
-                                add_tokens_to_tokenizer=False)
         optimizer = self.create_optimizer(model.model)
 
         if self.compile_model:
@@ -190,15 +180,13 @@ class Trainer:
 
         return model, optimizer
 
-    def create_dataloader(self, dataset, data_processor, sampler=None, shuffle=True):
-        # dataset = GLiNERDataset(dataset, config = self.config, data_processor=self.data_processor)
-        # collator = DataCollatorWithPadding(self.config)
-        collator = DataCollator(self.config, data_processor=data_processor, prepare_labels=True)
+    def create_dataloader(self, dataset, data_processor, collator_class, sampler=None, shuffle=True):
+        collator = collator_class(self.config, data_processor=data_processor, prepare_labels=True)
         data_loader = DataLoader(dataset, batch_size=self.config.train_batch_size, num_workers=12,
                                                         shuffle=shuffle, collate_fn=collator, sampler=sampler)
         return data_loader
     
-    def train_dist(self, rank, world_size, dataset):
+    def train_dist(self, rank, world_size, dataset, val_records=None, tracker=None):
         # Init distributed process group
         self.setup_distributed(rank, world_size)
 
@@ -208,12 +196,14 @@ class Trainer:
 
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
 
-        train_loader = self.create_dataloader(dataset, model.data_processor, sampler=sampler, shuffle=False)
+        train_loader = self.create_dataloader(dataset, model.data_processor, model.data_collator_class,
+                                               sampler=sampler, shuffle=False)
 
         num_steps = self.config.num_steps // world_size
 
         self.train(model=model, optimizer=optimizer, train_loader=train_loader,
-                   num_steps=num_steps, device=device, rank=rank)
+                   num_steps=num_steps, device=device, rank=rank,
+                   val_records=val_records, tracker=tracker)
 
         self.cleanup_distributed()
 
@@ -252,7 +242,8 @@ class Trainer:
             )
         return scheduler
 
-    def train(self, model, optimizer, train_loader, num_steps, device='cuda', rank=None):
+    def train(self, model, optimizer, train_loader, num_steps, device='cuda', rank=None,
+              val_records=None, tracker=None):
         model.train()
         pbar = tqdm(range(num_steps))
 
@@ -260,13 +251,14 @@ class Trainer:
         eval_every = self.config.eval_every
         save_total_limit = self.config.save_total_limit
         log_dir = self.config.log_dir
-        val_data_dir = self.config.val_data_dir
 
         num_warmup_steps = int(num_steps * warmup_ratio) if warmup_ratio < 1 else int(warmup_ratio)
 
         scheduler = self.init_scheduler(self.config.scheduler_type, optimizer, num_warmup_steps, num_steps)
         iter_train_loader = iter(train_loader)
-        scaler = torch.cuda.amp.GradScaler()
+
+        use_amp = device.startswith('cuda')
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
         for step in pbar:
             optimizer.zero_grad()
@@ -280,9 +272,9 @@ class Trainer:
             for k, v in x.items():
                 if isinstance(v, torch.Tensor):
                     x[k] = v.to(device)
-            
+
             try:
-                with torch.cuda.amp.autocast(dtype=torch.float16):
+                with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
                     loss = model(alpha = self.config.loss_alpha,
                                     gamma = self.config.loss_gamma,
                                     label_smoothing = self.config.label_smoothing,
@@ -299,11 +291,13 @@ class Trainer:
                 scaler.update()
                 scheduler.step()
                 del x
-                torch.cuda.empty_cache()
+                if use_amp:
+                    torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error: {e}")
                 del x
-                torch.cuda.empty_cache()
+                if use_amp:
+                    torch.cuda.empty_cache()
                 continue
 
             description = f"step: {step} | epoch: {step // len(train_loader)} | loss: {loss.item():.2f}"
@@ -313,23 +307,62 @@ class Trainer:
                 if rank is None or rank == 0:
                     checkpoint = f'model_{step + 1}'
                     save_top_k_checkpoints(model, log_dir, checkpoint, save_total_limit)
-                    if val_data_dir != "none":
-                        get_for_all_path(model, step, log_dir, val_data_dir)
+                    if val_records:
+                        eval_model = model.module if isinstance(model, DDP) else model
+                        f1, _ = evaluate_and_extract_f1(eval_model, val_records)
+                        improved = tracker.maybe_save(f1, eval_model, log_dir)
+                        marker = " (new best)" if improved else ""
+                        print(f"\n[eval] step={step + 1} F1={f1:.4f} best={tracker.best_f1:.4f}{marker}")
                     model.train()
 
     def run(self):
-        with open(self.config.train_data, 'r') as f:
-            data = json.load(f)
-        random.shuffle(data) 
+        seed = int(getattr(self.config, "seed", 42))
+        data = load_multi_dataset(self.config.train_data, seed=seed)
+
+        # Event models need config.trigger_types to split labels into triggers
+        # vs. arguments; the shipped event configs leave it empty. Derive from
+        # the raw (pre-windowing) records so the event head is fed triggers.
+        apply_derived_trigger_types(self.config, data)
+
+        data = window_records(data, max_len=self.config.max_len)
+        val_records = load_multi_dataset(getattr(self.config, "val_data", None), seed=seed)
+        test_records = load_multi_dataset(getattr(self.config, "test_data", None), seed=seed)
+        tracker = BestModelTracker()
+
+        trained_model = None
         if torch.cuda.device_count() > 1 and self.allow_distributed:
             world_size = torch.cuda.device_count()
-            mp.spawn(self.train_dist, args=(world_size, data), nprocs=world_size, join=True)
+            mp.spawn(self.train_dist, args=(world_size, data, val_records, tracker), nprocs=world_size, join=True)
         else:
             model, optimizer = self.setup_model_and_optimizer()
 
-            train_loader = self.create_dataloader(data, model.data_processor, shuffle=True)
+            train_loader = self.create_dataloader(data, model.data_processor, model.data_collator_class, shuffle=True)
 
-            self.train(model, optimizer, train_loader, num_steps=self.config.num_steps, device=self.device)
+            self.train(model, optimizer, train_loader, num_steps=self.config.num_steps, device=self.device,
+                       val_records=val_records, tracker=tracker)
+            trained_model = model
+
+        if not test_records:
+            return
+
+        best_dir = os.path.join(self.config.log_dir, "best")
+        if os.path.isdir(best_dir):
+            print(f"\nReloading best checkpoint from {best_dir} for the blind test...")
+            model_for_test = GLiNER.from_pretrained(best_dir)
+        elif trained_model is not None:
+            print("\nNo 'best' checkpoint found; using the final trained model.")
+            model_for_test = trained_model.module if isinstance(trained_model, DDP) else trained_model
+        else:
+            print("\nNo 'best' checkpoint found and no in-process model available "
+                  "(distributed run with no val_data); skipping blind test.")
+            return
+
+        eval_by_language = bool(getattr(self.config, "eval_by_language", False))
+        if eval_by_language:
+            blind_test_by_language(model_for_test, test_records, evaluate_kwargs={})
+        else:
+            f1, output = evaluate_and_extract_f1(model_for_test, test_records)
+            print_blind_test("all", f1, output, event_mode=bool(getattr(model_for_test.config, "event_mode", False)))
 
 
 def create_parser():
@@ -343,13 +376,21 @@ def create_parser():
     return parser
 
 
+def select_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
 if __name__ == "__main__":
     parser = create_parser()
     args = parser.parse_args()
-    config = load_config_as_namespace(args.config)
+    config = flatten_namespace(load_config_as_namespace(args.config))
     config.log_dir = args.log_dir
 
     trainer = Trainer(config, allow_distributed=args.allow_distributed,
                       compile_model = args.compile_model,
-                      device='cuda' if torch.cuda.is_available() else 'cpu')
+                      device=select_device())
     trainer.run()

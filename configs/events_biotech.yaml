@@ -1,0 +1,79 @@
+# events_biotech -- event extraction (trigger/argument).
+# No real train/val/test split exists upstream -- one converter run produces all three via a synthetic 80/10/10
+# (see data/_jsonl.py's SplitWriter). Convert first: uv run python data/convert_events_biotech.py --out data/events_biotech.jsonl
+# (see data/run_all_converters.sh, docs/data_converters.md for source/license).
+model:
+  # Model Configuration
+  model_name: microsoft/deberta-v3-small # Hugging Face model
+  labels_encoder: null  # Set to model name for bi-encoder architecture
+  name: "events biotech Events"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  fuse_layers: false
+  represent_spans: false
+  post_fusion_schema: null  # e.g., "l2l-l2t-t2t"
+  span_mode: markerV0  # Options: token_level | markerV0
+  max_types: 100
+  max_len: 512
+  max_neg_type_ratio: 1
+  relations_layer: "dot"  # Options: dot | mlp | bilinear (bipartite mode -- gcn/gat/attention unsupported)
+  triples_layer: null
+  event_mode: true
+  trigger_types: []  # Auto-derived from training-relation heads when left empty
+    # (train.py / custom_train.py). Relation-less event datasets (MAVEN, LEVEN,
+    # events_biotech) have nothing to derive from -- set their types explicitly.
+
+data:
+  # Directory Paths
+  root_dir: gliner_logs/events_biotech
+  train_data: "data/events_biotech.train.jsonl"
+  val_data: "data/events_biotech.val.jsonl"  # Set to validation data path, list of paths, or "none"
+  test_data: "data/events_biotech.test.jsonl"  # Set to test data path, list of paths, or "none" -- enables the blind test
+
+training:
+  # Pretrained Model Path
+  prev_path: null  # Use null for training from scratch, or path/repo for fine-tuning
+
+  # Training Parameters
+  num_epochs: 15  # Evaluated at the end of every epoch, not by step.
+  early_stopping_patience: 3  # Stop after 3 evals with no F1 improvement.
+  train_batch_size: 8
+  gradient_accumulation_steps: 1  # Effective batch size = train_batch_size x this. Raise to grow the effective batch without more memory.
+  window_stride: null  # Overlap (word tokens) between sliding-window chunks for documents
+    # longer than max_len. null = auto (max_len // 4 = 128 here). Lower = more overlap/windows.
+  eval_by_language: false  # If true, blind test prints a per-language breakdown, then all combined
+  threshold: 0.5  # Decision threshold for entity/relation/adjacency decoding.
+  threshold_sweep: false  # If true (default 5-point grid) or a list of candidate
+    # thresholds (e.g. [0.2, 0.3, 0.4]), calibrate against val_data after training
+    # and use the best-scoring threshold for the blind test instead of threshold above.
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"  # Options: linear, cosine, constant
+
+  # Loss Function Configuration
+  loss_alpha: 0.75
+  loss_gamma: 0
+  loss_prob_margin: 0
+  label_smoothing: 0
+  loss_reduction: "sum"
+  negatives: 1.0
+  masking: 'none'
+
+  # Learning Rate and Weight Decay
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.1
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+
+  # Checkpoint Management
+  save_total_limit: 3  # Maximum number of checkpoints to save
+
+  # Advanced Training Settings
+  size_sup: -1
+  shuffle_types: true
+  random_drop: true
+
+  freeze_components: null  # Examples: ['text_encoder']

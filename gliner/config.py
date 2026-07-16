@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 from transformers import PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
@@ -208,6 +208,8 @@ class UniEncoderRelexConfig(UniEncoderConfig):
         augment_rel_drop_prob=(0.0, 0.3),
         augment_add_other_prob=0.5,
         rel_id_to_classes: Optional[dict] = None,
+        event_mode: bool = False,
+        trigger_types: Optional[List[str]] = None,
         **kwargs,
     ):
         """Initialize UniEncoderRelexConfig.
@@ -232,6 +234,24 @@ class UniEncoderRelexConfig(UniEncoderConfig):
                 the per-type relation drop probability. Defaults to (0.0, 0.4).
             augment_add_other_prob (float, optional): Probability of adding "other" relation to a pair with no relation.
             rel_id_to_classes (Optional[dict]): Mapping from relation class IDs to class names. Defaults to None.
+            event_mode (bool, optional): If True, treats this as an event-extraction
+                model: relation/triple scoring operates over a bipartite
+                (trigger, argument) split -- built from two independently-selected
+                span sets, see represent_spans_bipartite -- instead of the full
+                entity-pair graph. "relation" then means "event role" and pairs
+                are always (trigger, argument), never argument-argument or
+                trigger-trigger. Requires `relations_layer` to be one of
+                'dot'/'mlp'/'bilinear' (see BipartiteRelationsRepLayer; 'gcn'/'gat'
+                are not supported in bipartite mode). Also requires
+                `trigger_class_mask` to be passed to forward() at both train and
+                inference time. Defaults to False.
+            trigger_types (List[str], optional): Entity-type labels that denote
+                event triggers (every other label is a regular argument-filler
+                entity type). Required when event_mode=True -- used to construct
+                EventExtractionSpanProcessor, which needs this set to split each
+                example's entities into trigger/argument sub-rankings. See
+                data/_trigger_types.py for how to derive it from converted
+                records. Defaults to None.
             **kwargs: Additional keyword arguments passed to UniEncoderConfig.
 
         Raises:
@@ -251,6 +271,8 @@ class UniEncoderRelexConfig(UniEncoderConfig):
         self.augment_rel_drop_prob = tuple(augment_rel_drop_prob)
         self.augment_add_other_prob = augment_add_other_prob
         self.rel_id_to_classes = rel_id_to_classes
+        self.event_mode = event_mode
+        self.trigger_types = trigger_types
 
 
 class UniEncoderSpanRelexConfig(UniEncoderRelexConfig):

@@ -14,6 +14,8 @@ usage
 configs
 training
 architectures
+events
+data_converters
 add_custom_architectures
 convert_to_onnx
 serving

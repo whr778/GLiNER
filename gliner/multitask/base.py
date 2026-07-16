@@ -3,8 +3,33 @@ from abc import ABC, abstractmethod
 from typing import List, Union, Optional
 
 import torch
+from transformers.utils import is_torch_mps_available
 
 from ..model import GLiNER
+
+
+def resolve_device(device: str) -> str:
+    """Resolve a requested device string to one actually usable on this machine.
+
+    ``"auto"`` picks the best available backend (cuda > mps > cpu). An
+    explicit request for an unavailable backend (e.g. ``"cuda:0"`` on a
+    machine without CUDA, or ``"mps"`` without Apple Silicon) falls back to
+    CPU with a warning, rather than raising.
+    """
+    if device == "auto":
+        if torch.cuda.is_available():
+            return "cuda:0"
+        if is_torch_mps_available():
+            return "mps"
+        return "cpu"
+
+    if "cuda" in device and not torch.cuda.is_available():
+        warnings.warn(f"{device} is not available, setting device as 'cpu'.", stacklevel=2)
+        return "cpu"
+    if device == "mps" and not is_torch_mps_available():
+        warnings.warn(f"{device} is not available, setting device as 'cpu'.", stacklevel=2)
+        return "cpu"
+    return device
 
 
 class GLiNERBasePipeline(ABC):
@@ -15,7 +40,8 @@ class GLiNERBasePipeline(ABC):
     Args:
         model_id (str): Identifier for the model to be loaded.
         prompt (str, optional): Prompt template for text preparation. Defaults to None.
-        device (str, optional): Device to run the model on ('cpu' or 'cuda:X'). Defaults to 'cuda:0'.
+        device (str, optional): Device to run the model on ('cpu', 'cuda:X', 'mps', or
+            'auto' to pick the best available backend). Defaults to 'auto'.
 
     Attributes:
         model (GLiNER): The loaded GLiNER model.
@@ -28,7 +54,7 @@ class GLiNERBasePipeline(ABC):
         model_id: Optional[str] = None,
         model: Optional[GLiNER] = None,
         prompt: Optional[str] = None,
-        device="cuda:0",
+        device="auto",
     ):
         """
         Initializes the GLiNERBasePipeline.
@@ -37,12 +63,10 @@ class GLiNERBasePipeline(ABC):
             model_id (str): Identifier for the model to be loaded.
             model (GLiNER, optional): GLiNER model instance.
             prompt (str, optional): Prompt template for text preparation. Defaults to None.
-            device (str, optional): Device to run the model on ('cpu' or 'cuda:X'). Defaults to 'cuda:0'.
+            device (str, optional): Device to run the model on ('cpu', 'cuda:X', 'mps', or
+                'auto' to pick the best available backend). Defaults to 'auto'.
         """
-        if "cuda" in device and not torch.cuda.is_available():
-            warnings.warn(f"{device} is not available, setting device as 'cpu'.", stacklevel=2)
-            device = "cpu"
-        self.device = device
+        self.device = resolve_device(device)
 
         if model is not None:
             self.model = model.to(self.device)

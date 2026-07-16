@@ -749,6 +749,21 @@ Weight for entity pair adjacency prediction loss.
 
 Weight for relation type classification loss.
 
+---
+
+#### `event_mode`
+`bool`, *optional*, defaults to `False`
+
+Switches from homogeneous entity-pair relation extraction to bipartite
+trigger/argument event extraction (same span encoder, KGE triples layer,
+and adjacency/relation losses; two independent span selections instead of
+one, paired trigger×argument instead of entity×entity). Requires
+`relations_layer` to be `"dot"`, `"mlp"`, or `"bilinear"` (not `"gcn"` /
+`"gat"` / `"attention"`) and a `trigger_class_mask` at both train and
+inference time (built automatically by `EventExtractionSpanProcessor` /
+`EventExtractionSpanDataCollator`). See [Event Extraction](events.md) for
+the full architecture, data format, and training walkthrough.
+
 ### Usage Example
 
 ```python

@@ -7,6 +7,7 @@ from .collator import (
     RelationExtractionSpanDataCollator,
     UniEncoderTokenDecoderDataCollator,
     RelationExtractionTokenDataCollator,
+    EventExtractionSpanDataCollator,
 )
 from .processor import (
     BaseProcessor,
@@ -19,5 +20,6 @@ from .processor import (
     RelationExtractionSpanProcessor,
     UniEncoderTokenDecoderProcessor,
     RelationExtractionTokenProcessor,
+    EventExtractionSpanProcessor,
 )
 from .tokenizer import WordsSplitter

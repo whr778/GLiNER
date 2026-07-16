@@ -16,7 +16,7 @@ class GLiNERClassifier(GLiNERBasePipeline):
     A class to evaluate the GLiNER model for classification tasks using F1 scores.
 
     Attributes:
-        device (str): Device to run the model on, e.g., 'cuda:0' or 'cpu'.
+        device (str): Device to run the model on, e.g., 'cuda:0', 'mps', or 'cpu'.
         model (GLiNER): Loaded GLiNER model instance.
         prompt (str): Template prompt for text classification.
 
@@ -41,7 +41,7 @@ class GLiNERClassifier(GLiNERBasePipeline):
         self,
         model_id: Optional[str] = None,
         model: Optional[GLiNER] = None,
-        device: str = "cuda:0",
+        device: str = "auto",
         prompt: Optional[str] = None,
     ):
         """
@@ -50,7 +50,8 @@ class GLiNERClassifier(GLiNERBasePipeline):
         Args:
             model_id (str, optional): Identifier for the model to be loaded. Defaults to None.
             model (GLiNER, optional): Preloaded GLiNER model. Defaults to None.
-            device (str, optional): Device to run the model on ('cpu' or 'cuda:X'). Defaults to 'cuda:0'.
+            device (str, optional): Device to run the model on ('cpu', 'cuda:X', 'mps', or
+                'auto' to pick the best available backend). Defaults to 'auto'.
             prompt (str, optional): Template prompt for text classification. Defaults to the class-level prompt.
         """
         # Use the provided prompt or default to the class-level prompt

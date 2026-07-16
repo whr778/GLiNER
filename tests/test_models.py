@@ -1,6 +1,10 @@
 import pytest
 
 from gliner import GLiNER
+from gliner.config import UniEncoderSpanRelexConfig
+from gliner.data_processing import EventExtractionSpanProcessor, RelationExtractionSpanProcessor
+from gliner.data_processing.collator import EventExtractionSpanDataCollator, RelationExtractionSpanDataCollator
+from gliner.decoding.decoder import EventSpanDecoder, SpanRelexDecoder
 from gliner.model import BaseEncoderGLiNER, UniEncoderSpanRelexGLiNER
 
 
@@ -77,3 +81,30 @@ def test_relex_prepare_batch_validates_per_text_relation_count():
             [["person"], ["organization"]],
             relations=[["works_at"]],
         )
+
+
+def _relex_model_with_config(event_mode, trigger_types=None):
+    model = UniEncoderSpanRelexGLiNER.__new__(UniEncoderSpanRelexGLiNER)
+    model.config = UniEncoderSpanRelexConfig(
+        model_name="prajjwal1/bert-tiny",
+        relations_layer="dot",
+        event_mode=event_mode,
+        trigger_types=trigger_types,
+    )
+    return model
+
+
+class TestEventModeClassDispatch:
+    def test_event_mode_selects_event_classes(self):
+        model = _relex_model_with_config(event_mode=True, trigger_types=["Life.Die"])
+
+        assert model.data_processor_class is EventExtractionSpanProcessor
+        assert model.data_collator_class is EventExtractionSpanDataCollator
+        assert model.decoder_class is EventSpanDecoder
+
+    def test_non_event_mode_selects_relex_classes(self):
+        model = _relex_model_with_config(event_mode=False)
+
+        assert model.data_processor_class is RelationExtractionSpanProcessor
+        assert model.data_collator_class is RelationExtractionSpanDataCollator
+        assert model.decoder_class is SpanRelexDecoder

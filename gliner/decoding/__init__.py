@@ -5,4 +5,5 @@ from .decoder import (
     TokenRelexDecoder,
     SpanGenerativeDecoder,
     TokenGenerativeDecoder,
+    EventSpanDecoder,
 )

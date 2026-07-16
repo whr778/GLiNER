@@ -50,6 +50,7 @@ from .decoding import (
     TokenRelexDecoder,
     SpanGenerativeDecoder,
     TokenGenerativeDecoder,
+    EventSpanDecoder,
 )
 from .training import Trainer, TrainingArguments
 from .evaluation import BaseNEREvaluator, BaseRelexEvaluator
@@ -86,6 +87,7 @@ from .data_processing import (
     RelationExtractionSpanProcessor,
     UniEncoderTokenDecoderProcessor,
     RelationExtractionTokenProcessor,
+    EventExtractionSpanProcessor,
 )
 from .data_processing.collator import (
     BiEncoderSpanDataCollator,
@@ -96,8 +98,15 @@ from .data_processing.collator import (
     RelationExtractionSpanDataCollator,
     UniEncoderTokenDecoderDataCollator,
     RelationExtractionTokenDataCollator,
+    EventExtractionSpanDataCollator,
 )
 from .data_processing.tokenizer import WordsSplitter
+from .data_processing.windowing import (
+    group_and_merge_relex_outputs,
+    group_and_merge_spans,
+    prepare_windowed_items,
+    window_input_spans,
+)
 
 if is_module_available("onnxruntime"):
     import onnxruntime as ort
@@ -1740,6 +1749,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         freeze_components: Optional[list[str]] = None,
         compile_model: bool = False,
         output_dir: Optional[Union[str, Path]] = None,
+        callbacks: Optional[list] = None,
         **training_kwargs,
     ) -> Trainer:
         """Train the model.
@@ -1751,6 +1761,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             freeze_components: List of component names to freeze (e.g., ['text_encoder', 'decoder']).
             compile_model: Whether to compile model with torch.compile.
             output_dir: Output directory (required if training_args is None).
+            callbacks: Optional list of transformers.TrainerCallback instances.
             **training_kwargs: Additional kwargs for creating training args.
 
         Returns:
@@ -1788,6 +1799,9 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             trainer_kwargs["tokenizer"] = self.data_processor.transformer_tokenizer
         else:
             trainer_kwargs["processing_class"] = self.data_processor.transformer_tokenizer
+
+        if callbacks:
+            trainer_kwargs["callbacks"] = callbacks
 
         trainer = Trainer(**trainer_kwargs)
 
@@ -2268,9 +2282,16 @@ class BaseEncoderGLiNER(BaseGLiNER):
         packing_config: Optional[InferencePackingConfig] = None,
         input_spans: Optional[List[List[Dict]]] = None,
         return_class_probs: bool = False,
+        window_stride: Optional[int] = None,
         **external_inputs,
     ) -> List[List[Dict[str, Any]]]:
         """Predict entities for a batch of texts.
+
+        Texts longer than ``config.max_len`` words are split into
+        overlapping windows for the forward pass (instead of being silently
+        truncated), and each text's window predictions are merged back into
+        document-level word-token coordinates before being mapped to
+        character offsets.
 
         Args:
             texts: A list of input texts to predict entities for or a single text string.
@@ -2283,6 +2304,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
                 the instance-level configuration set via configure_inference_packing is used.
             input_spans: Input entity spans that should be classified by the model.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            window_stride: Overlap (in word tokens) between consecutive windows for
+                texts longer than ``config.max_len``. Defaults to 25% of max_len.
             **external_inputs: Additional inputs to pass to the model.
 
         Returns:
@@ -2301,13 +2324,18 @@ class BaseEncoderGLiNER(BaseGLiNER):
         if not prepared["valid_texts"]:
             return [[] for _ in range(prepared["num_original"])]
 
+        window_items, owner_idx, offsets = prepare_windowed_items(
+            prepared["input_x"], self.config.max_len, window_stride
+        )
+        windowed_input_spans = window_input_spans(prepared["word_input_spans"], window_items, owner_idx, offsets)
+
         collator = self.create_collator()
 
         def collate_fn(batch):
             return self.collate_batch(batch, prepared["entity_types"], collator)
 
         data_loader = torch.utils.data.DataLoader(
-            prepared["input_x"],
+            window_items,
             batch_size=batch_size,
             shuffle=False,
             collate_fn=collate_fn,
@@ -2315,16 +2343,18 @@ class BaseEncoderGLiNER(BaseGLiNER):
 
         active_packing = packing_config if packing_config is not None else self._inference_packing_config
 
-        outputs = self._process_batches(
+        window_outputs = self._process_batches(
             data_loader,
             threshold,
             flat_ner,
             multi_label,
             packing_config=active_packing,
             return_class_probs=return_class_probs,
-            word_input_spans=prepared["word_input_spans"],
+            word_input_spans=windowed_input_spans,
             **external_inputs,
         )
+
+        outputs = group_and_merge_spans(window_outputs, owner_idx, offsets, len(prepared["valid_texts"]))
 
         all_entities = self.map_entities_to_text(
             outputs,
@@ -2422,8 +2452,16 @@ class BaseEncoderGLiNER(BaseGLiNER):
         threshold: float = 0.5,
         batch_size: int = 12,
         entity_types: Optional[List[str]] = None,
+        window_stride: Optional[int] = None,
     ) -> Tuple[Any, float]:
         """Evaluate the model on a given test dataset.
+
+        Records longer than ``config.max_len`` are split into overlapping
+        windows for the forward pass (instead of being silently truncated),
+        and each record's window predictions are merged back into
+        document-level coordinates before scoring. Gold entities are read
+        directly from ``test_data`` (never truncated), so each record is
+        scored exactly once against its full, untruncated annotation set.
 
         Args:
             test_data: The test data containing text and entity annotations.
@@ -2432,26 +2470,28 @@ class BaseEncoderGLiNER(BaseGLiNER):
             threshold: The threshold for predictions. Defaults to 0.5.
             batch_size: The batch size for evaluation. Defaults to 12.
             entity_types: Optional list of entity types to evaluate. If None, extracts from test data. Defaults to None.
+            window_stride: Overlap (in word tokens) between consecutive windows for
+                records longer than ``config.max_len``. Defaults to 25% of max_len.
 
         Returns:
             Tuple containing the evaluation output and the F1 score.
         """
         self.eval()
-        # Create the dataset and data loader
-        dataset = test_data
+
+        window_items, owner_idx, offsets = prepare_windowed_items(test_data, self.config.max_len, window_stride)
         collator = self.create_collator()
 
         def collate_fn(batch):
             return self.collate_batch(batch, entity_types, collator)
 
-        data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        data_loader = torch.utils.data.DataLoader(
+            window_items, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+        )
 
-        all_preds = self._process_batches(data_loader, threshold, flat_ner, multi_label)
-        all_trues = []
+        window_preds = self._process_batches(data_loader, threshold, flat_ner, multi_label)
 
-        # Iterate over data batches
-        for batch in data_loader:
-            all_trues.extend(batch["entities"])
+        all_preds = group_and_merge_spans(window_preds, owner_idx, offsets, len(test_data))
+        all_trues = [record.get("ner", []) or [] for record in test_data]
 
         # Evaluate the predictions
         evaluator = BaseNEREvaluator(all_trues, all_preds)
@@ -3595,12 +3635,32 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
     config_class = UniEncoderSpanRelexConfig
     model_class = UniEncoderSpanRelexModel
     ort_model_class: type = UniEncoderSpanRelexORTModel
-    data_processor_class = RelationExtractionSpanProcessor
-    data_collator_class = RelationExtractionSpanDataCollator
-    decoder_class = SpanRelexDecoder
+
+    @property
+    def data_processor_class(self):
+        """EventExtractionSpanProcessor for event_mode, else plain RelEx."""
+        if getattr(self.config, "event_mode", False):
+            return EventExtractionSpanProcessor
+        return RelationExtractionSpanProcessor
+
+    @property
+    def data_collator_class(self):
+        """EventExtractionSpanDataCollator for event_mode, else plain RelEx."""
+        if getattr(self.config, "event_mode", False):
+            return EventExtractionSpanDataCollator
+        return RelationExtractionSpanDataCollator
+
+    @property
+    def decoder_class(self):
+        """EventSpanDecoder for event_mode (reads trigger_spans/arg_spans
+        instead of one merged entity_spans list), else plain SpanRelexDecoder.
+        """
+        if getattr(self.config, "event_mode", False):
+            return EventSpanDecoder
+        return SpanRelexDecoder
 
     def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
-        """Create relation extraction data processor."""
+        """Create relation extraction (or, for event_mode, event extraction) data processor."""
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
             self._set_tokenizer_spec_tokens(tokenizer)
@@ -3608,7 +3668,12 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         if words_splitter is None:
             words_splitter = WordsSplitter(config.words_splitter_type)
 
-        self.data_processor = self.data_processor_class(config, tokenizer, words_splitter)
+        if getattr(config, "event_mode", False):
+            self.data_processor = self.data_processor_class(
+                config, tokenizer, words_splitter, config.trigger_types or []
+            )
+        else:
+            self.data_processor = self.data_processor_class(config, tokenizer, words_splitter)
         return self.data_processor
 
     def _get_special_tokens(self):
@@ -3799,6 +3864,14 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         if entity_spans is not None and not isinstance(entity_spans, torch.Tensor):
             entity_spans = torch.from_numpy(entity_spans)
 
+        trigger_spans = getattr(model_output, "trigger_spans", None)
+        if trigger_spans is not None and not isinstance(trigger_spans, torch.Tensor):
+            trigger_spans = torch.from_numpy(trigger_spans)
+
+        arg_spans = getattr(model_output, "arg_spans", None)
+        if arg_spans is not None and not isinstance(arg_spans, torch.Tensor):
+            arg_spans = torch.from_numpy(arg_spans)
+
         decoded_results = self.decoder.decode(
             batch["tokens"],
             batch["id_to_classes"],
@@ -3812,6 +3885,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             multi_label=multi_label,
             rel_id_to_classes=batch["rel_id_to_classes"],
             entity_spans=entity_spans,
+            trigger_spans=trigger_spans,
+            arg_spans=arg_spans,
         )
 
         if len(decoded_results) == 2:
@@ -3978,8 +4053,15 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         input_spans: Optional[List[List[Dict]]] = None,
         return_relations: bool = True,
         return_class_probs: bool = False,
+        window_stride: Optional[int] = None,
     ) -> Union[List[List[Dict[str, Any]]], Tuple[List[List[Dict[str, Any]]], List[List[Dict[str, Any]]]]]:
         """Predict entities and relations.
+
+        Texts longer than ``config.max_len`` words are split into
+        overlapping windows for the forward pass (instead of being silently
+        truncated). Entity predictions are merged back into document-level
+        coordinates; a relation is recoverable only if both its head and
+        tail entity land in the same window.
 
         Args:
             texts: Input texts (str or List[str]).
@@ -3996,6 +4078,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 with 'start' and 'end' character positions.
             return_relations: Whether to return relation predictions.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            window_stride: Overlap (in word tokens) between consecutive windows for
+                texts longer than ``config.max_len``. Defaults to 25% of max_len.
 
         Returns:
             Tuple of (entities, relations) if return_relations=True, else just entities.
@@ -4015,13 +4099,18 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         if adjacency_threshold is None:
             adjacency_threshold = threshold
 
+        window_items, owner_idx, offsets = prepare_windowed_items(
+            prepared["input_x"], self.config.max_len, window_stride
+        )
+        windowed_input_spans = window_input_spans(prepared["word_input_spans"], window_items, owner_idx, offsets)
+
         collator = self.create_collator()
 
         def collate_fn(batch):
             return self.collate_batch(batch, prepared["entity_types"], collator, prepared["relation_types"])
 
         data_loader = torch.utils.data.DataLoader(
-            prepared["input_x"],
+            window_items,
             batch_size=batch_size,
             shuffle=False,
             collate_fn=collate_fn,
@@ -4029,17 +4118,21 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
 
         active_packing = packing_config if packing_config is not None else self._inference_packing_config
 
-        entity_outputs, relation_outputs = self._process_batches(
+        window_entity_outputs, window_relation_outputs = self._process_batches(
             data_loader,
             threshold,
             flat_ner,
             multi_label,
             packing_config=active_packing,
             return_class_probs=return_class_probs,
-            word_input_spans=prepared["word_input_spans"],
+            word_input_spans=windowed_input_spans,
             adjacency_threshold=adjacency_threshold,
             relation_threshold=relation_threshold,
             return_relations=return_relations,
+        )
+
+        entity_outputs, relation_outputs = group_and_merge_relex_outputs(
+            window_entity_outputs, window_relation_outputs, owner_idx, offsets, len(prepared["valid_texts"])
         )
 
         all_entities = self.map_entities_to_text(
@@ -4245,8 +4338,17 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         relation_threshold: Optional[float] = None,
         batch_size: int = 12,
         entity_types: Optional[List[str]] = None,
+        window_stride: Optional[int] = None,
     ) -> Tuple[Tuple[Any, float], Tuple[Any, float]]:
         """Evaluate the model on both NER and relation extraction tasks.
+
+        Records longer than ``config.max_len`` are split into overlapping
+        windows for the forward pass (instead of being silently truncated).
+        Entity predictions merge back into document-level coordinates;
+        relations are only recoverable when both their head and tail entity
+        land in the same window. Gold entities/relations are read directly
+        from ``test_data`` (never truncated), so each record is scored
+        exactly once against its full, untruncated annotation set.
 
         Args:
             test_data: The test data containing text, entity, and relation annotations.
@@ -4257,6 +4359,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             relation_threshold: The threshold for relation predictions. Defaults to threshold.
             batch_size: The batch size for evaluation. Defaults to 12.
             entity_types: Optional list of entity types to evaluate. If None, extracts from test data. Defaults to None.
+            window_stride: Overlap (in word tokens) between consecutive windows for
+                records longer than ``config.max_len``. Defaults to 25% of max_len.
 
         Returns:
             Tuple of ((ner_output, ner_f1), (rel_output, rel_f1)) containing:
@@ -4274,7 +4378,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             adjacency_threshold = threshold
 
         # Create the dataset and data loader
-        dataset = test_data
+        window_items, owner_idx, offsets = prepare_windowed_items(test_data, self.config.max_len, window_stride)
         collator = self.data_collator_class(
             self.config,
             data_processor=self.data_processor,
@@ -4289,12 +4393,12 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         def collate_fn(batch):
             return collator(batch, entity_types=entity_types)
 
-        data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        data_loader = torch.utils.data.DataLoader(
+            window_items, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+        )
 
-        all_entity_preds = []
-        all_relation_preds = []
-        all_true_entities = []
-        all_true_relations = []
+        window_entity_preds = []
+        window_relation_preds = []
 
         # Iterate over data batches
         for batch in data_loader:
@@ -4326,6 +4430,14 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             if entity_spans is not None and not isinstance(entity_spans, torch.Tensor):
                 entity_spans = torch.from_numpy(entity_spans)
 
+            trigger_spans = getattr(model_output, "trigger_spans", None)
+            if trigger_spans is not None and not isinstance(trigger_spans, torch.Tensor):
+                trigger_spans = torch.from_numpy(trigger_spans)
+
+            arg_spans = getattr(model_output, "arg_spans", None)
+            if arg_spans is not None and not isinstance(arg_spans, torch.Tensor):
+                arg_spans = torch.from_numpy(arg_spans)
+
             # Decode predictions
             decoded_results = self.decoder.decode(
                 batch["tokens"],
@@ -4339,6 +4451,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 relation_threshold=relation_threshold,
                 multi_label=multi_label,
                 rel_id_to_classes=batch["rel_id_to_classes"],
+                trigger_spans=trigger_spans,
+                arg_spans=arg_spans,
                 entity_spans=entity_spans,
             )
 
@@ -4349,12 +4463,14 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 decoded_entities = decoded_results
                 decoded_relations = [[] for _ in range(len(decoded_entities))]
 
-            all_entity_preds.extend(decoded_entities)
-            all_relation_preds.extend(decoded_relations)
+            window_entity_preds.extend(decoded_entities)
+            window_relation_preds.extend(decoded_relations)
 
-            # Extract ground truth
-            all_true_entities.extend(batch["entities"])
-            all_true_relations.extend(batch.get("relations", [[] for _ in range(len(batch["entities"]))]))
+        all_entity_preds, all_relation_preds = group_and_merge_relex_outputs(
+            window_entity_preds, window_relation_preds, owner_idx, offsets, len(test_data)
+        )
+        all_true_entities = [record.get("ner", []) or [] for record in test_data]
+        all_true_relations = [record.get("relations", []) or [] for record in test_data]
 
         # Evaluate NER
         ner_evaluator = BaseNEREvaluator(all_true_entities, all_entity_preds)
@@ -4877,6 +4993,14 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
                 raise FileNotFoundError(f"Config file not found: {config}")
         elif isinstance(config, dict):
             config_ = GLiNERConfig(**config)
+        else:
+            # Already a GLiNERConfig(-subclass) object. Rebuild a base
+            # GLiNERConfig from its dict (like the dict branch) so
+            # _get_gliner_class sees every discriminating field with a default,
+            # even ones a subclass config omits (e.g. labels_encoder).
+            config_dict = config.to_dict()
+            config_dict.pop("model_type", None)
+            config_ = GLiNERConfig(**config_dict)
 
         # Determine the appropriate class
         gliner_class = cls._get_gliner_class(config_)
