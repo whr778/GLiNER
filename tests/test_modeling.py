@@ -1365,6 +1365,11 @@ class TestUniEncoderSpanRelexModelEventMode:
 
         assert output.loss is not None
         assert torch.isfinite(output.loss)
+        # The span (NER) component is exposed (detached) for training-time logging;
+        # adj/rel components are exposed too when the pairing path runs (real batch,
+        # covered in test_models.py).
+        assert output.span_loss is not None and torch.isfinite(output.span_loss)
+        assert not output.span_loss.requires_grad
         output.loss.backward()
 
     def test_event_mode_off_leaves_forward_unaffected(self, mock_config, model_inputs):

@@ -168,7 +168,31 @@ class Trainer(transformers.Trainer):
         )
 
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        self._accumulate_loss_components(outputs)
         return (loss, outputs) if return_outputs else loss
+
+    def _accumulate_loss_components(self, outputs) -> None:
+        """Sum the raw per-component losses (span/adj/rel) between log steps so
+        ``log`` can report their running mean next to the total loss -- makes
+        event training transparent (is the adjacency/role loss actually falling?)
+        instead of only showing the combined loss."""
+        if not hasattr(self, "_loss_components"):
+            self._loss_components = {"span_loss": [0.0, 0], "adj_loss": [0.0, 0], "rel_loss": [0.0, 0]}
+        for name, acc in self._loss_components.items():
+            val = getattr(outputs, name, None)
+            if val is not None:
+                acc[0] += float(val)
+                acc[1] += 1
+
+    def log(self, logs, *args, **kwargs):
+        """Inject the mean span/adjacency/role loss since the last log into the
+        logged metrics (no-op for non-relex models, which never set them)."""
+        for name, acc in getattr(self, "_loss_components", {}).items():
+            total, count = acc
+            if count > 0:
+                logs[name] = round(total / count, 4)
+                self._loss_components[name] = [0.0, 0]
+        return super().log(logs, *args, **kwargs)
 
     def training_step(
         self,

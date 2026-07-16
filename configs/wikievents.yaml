@@ -44,8 +44,8 @@ model:
   # (adjacency/role) losses -- measured on WikiEvents -- so at coef 1.0 the event
   # heads barely train while entity NER dominates. Upweight the event losses.
   # Starting points; tune by watching whether adj_loss/rel_loss actually fall.
-  adjacency_loss_coef: 50   # trigger <-> argument linking
-  relation_loss_coef: 50    # argument-role classification
+  adjacency_loss_coef: 5    # trigger <-> argument linking
+  relation_loss_coef: 5     # argument-role classification
   trigger_types: []  # Auto-derived from training-relation heads when left empty
     # (train.py / custom_train.py). Relation-less event datasets (MAVEN, LEVEN,
     # events_biotech) have nothing to derive from -- set their types explicitly.
@@ -62,7 +62,7 @@ training:
   prev_path: null  # Use null for training from scratch, or path/repo for fine-tuning
 
   # Training Parameters
-  num_epochs: 15  # Evaluated at the end of every epoch, not by step.
+  num_epochs: 3  # Evaluated at the end of every epoch, not by step.
   early_stopping_patience: 5  # Stop after N evals with no F1 improvement. Kept
     # generous for events: entity NER plateaus early while event roles learn
     # slower, so a tight patience can halt before roles improve.

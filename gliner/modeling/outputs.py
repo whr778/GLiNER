@@ -114,3 +114,9 @@ class GLiNERRelexOutput(GLiNERBaseOutput):
     rel_prompts_embedding_mask: Optional[torch.LongTensor] = None
     trigger_spans: Optional[torch.LongTensor] = None
     arg_spans: Optional[torch.LongTensor] = None
+    # Detached raw per-component losses (before their config coefficients), for
+    # training-time visibility. span = NER/span loss, adj = trigger<->argument
+    # adjacency loss, rel = relation/event-role classification loss.
+    span_loss: Optional[torch.FloatTensor] = None
+    adj_loss: Optional[torch.FloatTensor] = None
+    rel_loss: Optional[torch.FloatTensor] = None

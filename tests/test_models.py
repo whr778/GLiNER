@@ -94,6 +94,35 @@ def _relex_model_with_config(event_mode, trigger_types=None):
     return model
 
 
+def test_event_forward_exposes_all_loss_components():
+    """On a real event batch the forward exposes span/adj/rel raw losses
+    (detached) so training can log them per component."""
+    import torch
+    from gliner.data_processing.trigger_types import derive_trigger_types
+
+    recs = [{
+        "tokenized_text": ["John", "attacked", "Paris"],
+        "ner": [[0, 0, "Person"], [1, 1, "Attack"], [2, 2, "Location"]],
+        "relations": [[1, 0, "Attacker"], [1, 2, "Place"]],
+    }]
+    trig = sorted(derive_trigger_types(recs))
+    cfg = UniEncoderSpanRelexConfig(
+        model_name="prajjwal1/bert-tiny", relations_layer="dot", event_mode=True,
+        trigger_types=trig, max_width=4, max_len=64,
+    )
+    model = UniEncoderSpanRelexGLiNER.load_from_config(cfg)
+    collator = model.data_collator_class(cfg, data_processor=model.data_processor, prepare_labels=True)
+    batch = collator(recs, entity_types=[["Attack", "Person", "Location"]],
+                     relation_types=[["Attacker", "Place"]])
+    tensors = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+    tensors["text_lengths"] = batch["text_lengths"]
+
+    model.train()
+    out = model.model(**tensors)
+    for comp in (out.span_loss, out.adj_loss, out.rel_loss):
+        assert comp is not None and torch.isfinite(comp) and not comp.requires_grad
+
+
 class TestEventModeClassDispatch:
     def test_event_mode_selects_event_classes(self):
         model = _relex_model_with_config(event_mode=True, trigger_types=["Life.Die"])

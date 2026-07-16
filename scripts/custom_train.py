@@ -270,11 +270,12 @@ class Trainer:
 
             try:
                 with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-                    loss = model(alpha = self.config.loss_alpha,
+                    out = model(alpha = self.config.loss_alpha,
                                     gamma = self.config.loss_gamma,
                                     label_smoothing = self.config.label_smoothing,
                                     reduction = self.config.loss_reduction,
-                                    **x).loss
+                                    **x)
+                    loss = out.loss
 
                 if torch.isnan(loss).any():
                     print("Warning: NaN loss detected")
@@ -295,7 +296,13 @@ class Trainer:
                     torch.cuda.empty_cache()
                 continue
 
-            description = f"step: {step} | epoch: {step // len(train_loader)} | loss: {loss.item():.2f}"
+            comps = []
+            for name in ("span_loss", "adj_loss", "rel_loss"):
+                val = getattr(out, name, None)
+                if val is not None:
+                    comps.append(f"{name.split('_')[0]}={float(val):.2f}")
+            comp_str = (" | " + " ".join(comps)) if comps else ""
+            description = f"step: {step} | epoch: {step // len(train_loader)} | loss: {loss.item():.2f}{comp_str}"
             pbar.set_description(description)
 
             if (step + 1) % eval_every == 0:

@@ -398,6 +398,36 @@ class TestSaveTopKCheckpoints:
         assert m["entity_label"] == "Entity" and m["pair_label"] == "Relation"
 
 
+class TestTrainerLossComponentLogging:
+    def _trainer(self):
+        from gliner.training.trainer import Trainer
+        return Trainer.__new__(Trainer)  # no HF init; only exercising the buffer helper
+
+    def test_accumulates_component_losses(self):
+        import torch
+        tr = self._trainer()
+
+        class O:
+            span_loss = torch.tensor(10.0)
+            adj_loss = torch.tensor(2.0)
+            rel_loss = torch.tensor(3.0)
+
+        tr._accumulate_loss_components(O())
+        tr._accumulate_loss_components(O())
+        assert tr._loss_components["span_loss"] == [20.0, 2]
+        assert tr._loss_components["adj_loss"] == [4.0, 2]
+        assert tr._loss_components["rel_loss"] == [6.0, 2]
+
+    def test_ignores_missing_components(self):
+        tr = self._trainer()
+
+        class O:  # NER-only output has no component attributes
+            pass
+
+        tr._accumulate_loss_components(O())
+        assert tr._loss_components == {"span_loss": [0.0, 0], "adj_loss": [0.0, 0], "rel_loss": [0.0, 0]}
+
+
 class TestWarnIfMaxTypesTruncates:
     RECORDS = [
         {"ner": [[0, 0, "A"], [1, 1, "B"], [2, 2, "C"]], "relations": [[0, 1, "r1"], [0, 2, "r2"]]},

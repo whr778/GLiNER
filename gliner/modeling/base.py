@@ -2558,10 +2558,12 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                 pair_scores = triple_scores_flat.view(B, N, C_rel)
 
         loss = None
+        span_loss_val = adj_loss_val = rel_loss_val = None  # raw components, for logging
         if labels is not None:
             num_ner_classes = prompts_embedding_mask.shape[-1]
             if num_ner_classes > 0:
                 loss = self.loss(scores, labels, prompts_embedding_mask, span_mask=span_mask, word_mask=mask, **kwargs)
+            span_loss_val = loss
 
             if has_relex and rel_matrix is not None and C_rel > 0:
                 rel_labels_selected = rel_matrix
@@ -2595,6 +2597,7 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                 rel_kwargs["gamma"] = rel_kwargs.pop("rel_gamma", rel_kwargs.get("gamma", 0.0))
 
                 rel_loss = self.rel_loss(pair_scores, rel_labels_selected, rel_mask_selected, class_mask, **rel_kwargs)
+                rel_loss_val = rel_loss
 
                 span_loss = loss * self.config.span_loss_coef if loss is not None else 0.0
 
@@ -2604,6 +2607,7 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                     else:
                         adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
                     adj_loss = self.adj_loss(pred_adj_matrix, adj_matrix, adj_mask, **rel_kwargs)
+                    adj_loss_val = adj_loss
 
                     loss = (
                         span_loss
@@ -2633,6 +2637,9 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             entity_spans=None if is_training else entity_spans,
             trigger_spans=None if (is_training or not event_mode) else trigger_spans,
             arg_spans=None if (is_training or not event_mode) else arg_spans,
+            span_loss=span_loss_val.detach() if torch.is_tensor(span_loss_val) else None,
+            adj_loss=adj_loss_val.detach() if torch.is_tensor(adj_loss_val) else None,
+            rel_loss=rel_loss_val.detach() if torch.is_tensor(rel_loss_val) else None,
         )
         return output
 
