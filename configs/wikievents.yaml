@@ -40,6 +40,12 @@ model:
   relations_layer: "dot"  # Options: dot | mlp | bilinear (bipartite mode -- gcn/gat/attention unsupported)
   triples_layer: null
   event_mode: true # create an event model
+  # Under loss_reduction: sum the NER span loss is ~300x larger than the event
+  # (adjacency/role) losses -- measured on WikiEvents -- so at coef 1.0 the event
+  # heads barely train while entity NER dominates. Upweight the event losses.
+  # Starting points; tune by watching whether adj_loss/rel_loss actually fall.
+  adjacency_loss_coef: 50   # trigger <-> argument linking
+  relation_loss_coef: 50    # argument-role classification
   trigger_types: []  # Auto-derived from training-relation heads when left empty
     # (train.py / custom_train.py). Relation-less event datasets (MAVEN, LEVEN,
     # events_biotech) have nothing to derive from -- set their types explicitly.
@@ -57,7 +63,14 @@ training:
 
   # Training Parameters
   num_epochs: 15  # Evaluated at the end of every epoch, not by step.
-  early_stopping_patience: 3  # Stop after 3 evals with no F1 improvement.
+  early_stopping_patience: 5  # Stop after N evals with no F1 improvement. Kept
+    # generous for events: entity NER plateaus early while event roles learn
+    # slower, so a tight patience can halt before roles improve.
+  # Checkpoint/early-stopping F1 = (1 - rel_metric_weight)*entity_F1 +
+  # rel_metric_weight*role_F1. 0.5 = plain average (entity NER dominates).
+  # Higher weights the event-role side so the tracked metric keeps improving
+  # while roles are still learning, instead of following entity NER.
+  rel_metric_weight: 0.7
   train_batch_size: 4
   gradient_accumulation_steps: 4  # Effective batch size = train_batch_size x this. Raise to grow the effective batch without more memory.
   window_stride: null  # Overlap (word tokens) between sliding-window chunks for documents

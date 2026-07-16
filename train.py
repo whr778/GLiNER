@@ -52,17 +52,21 @@ class BestF1Callback(TrainerCallback):
     (``control.should_training_stop = True``) once ``patience`` is exceeded.
     """
 
-    def __init__(self, eval_records, output_dir, evaluate_kwargs, patience=None, data_stats=None):
+    def __init__(self, eval_records, output_dir, evaluate_kwargs, patience=None, data_stats=None,
+                 rel_metric_weight=0.5):
         self.eval_records = eval_records
         self.output_dir = output_dir
         self.evaluate_kwargs = evaluate_kwargs
         self.tracker = BestModelTracker(card_data_stats=data_stats)
         self.patience = patience
         self.evals_without_improvement = 0
+        self.rel_metric_weight = rel_metric_weight
 
     def on_evaluate(self, args, state, control, **kwargs):
         model = kwargs["model"]
-        f1, _ = evaluate_and_extract_f1(model, self.eval_records, **self.evaluate_kwargs)
+        f1, _ = evaluate_and_extract_f1(
+            model, self.eval_records, rel_metric_weight=self.rel_metric_weight, **self.evaluate_kwargs
+        )
         improved = self.tracker.maybe_save(f1, model, self.output_dir)
         marker = " (new best)" if improved else ""
         print(f"\n[eval] step={state.global_step} F1={f1:.4f} best={self.tracker.best_f1:.4f}{marker}")
@@ -185,6 +189,11 @@ def main(cfg_path: str):
 
     early_stopping_patience = getattr(cfg.training, "early_stopping_patience", None)
 
+    # For event/relation models, bias checkpoint selection + early stopping
+    # toward the relation (event-role) F1 so training doesn't stop the moment
+    # the much larger entity-NER F1 plateaus (0.5 = plain average).
+    rel_metric_weight = float(getattr(cfg.training, "rel_metric_weight", 0.5))
+
     callbacks = []
     best_cb = None
     if eval_dataset is not None:
@@ -194,6 +203,7 @@ def main(cfg_path: str):
             evaluate_kwargs={"window_stride": window_stride, "threshold": threshold},
             patience=early_stopping_patience,
             data_stats=data_stats,
+            rel_metric_weight=rel_metric_weight,
         )
         callbacks.append(best_cb)
 

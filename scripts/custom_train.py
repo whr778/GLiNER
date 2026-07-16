@@ -312,7 +312,10 @@ class Trainer:
                     save_top_k_checkpoints(model, log_dir, checkpoint, save_total_limit)
                     if val_records:
                         eval_model = model.module if isinstance(model, DDP) else model
-                        f1, _ = evaluate_and_extract_f1(eval_model, val_records)
+                        f1, _ = evaluate_and_extract_f1(
+                            eval_model, val_records,
+                            rel_metric_weight=float(getattr(self.config, "rel_metric_weight", 0.5)),
+                        )
                         improved = tracker.maybe_save(f1, eval_model, log_dir)
                         marker = " (new best)" if improved else ""
                         print(f"\n[eval] step={step + 1} F1={f1:.4f} best={tracker.best_f1:.4f}{marker}")

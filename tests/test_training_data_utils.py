@@ -194,6 +194,30 @@ class TestEvaluateAndExtractF1:
         evaluate_and_extract_f1(model, [], threshold=0.3, batch_size=4)
         assert captured == {"threshold": 0.3, "batch_size": 4}
 
+    def test_rel_metric_weight_biases_toward_role_f1(self):
+        model = type("M", (), {
+            "evaluate": lambda self, records, **kw: (("ner", 0.9), ("rel", 0.1))
+        })()
+        # 0.5 = plain average; higher weights the (low) role F1 more, lowering the metric
+        assert evaluate_and_extract_f1(model, [], rel_metric_weight=0.5)[0] == pytest.approx(0.5)
+        assert evaluate_and_extract_f1(model, [], rel_metric_weight=0.75)[0] == pytest.approx(0.3)
+        assert evaluate_and_extract_f1(model, [], rel_metric_weight=1.0)[0] == pytest.approx(0.1)
+
+    def test_rel_metric_weight_ignored_for_ner_only(self):
+        model = type("M", (), {"evaluate": lambda self, records, **kw: ("report", 0.75)})()
+        assert evaluate_and_extract_f1(model, [], rel_metric_weight=0.9)[0] == 0.75
+
+    def test_rel_metric_weight_not_forwarded_to_evaluate(self):
+        captured = {}
+
+        def fake_evaluate(self, records, **kw):
+            captured.update(kw)
+            return ("report", 1.0)
+
+        model = type("M", (), {"evaluate": fake_evaluate})()
+        evaluate_and_extract_f1(model, [], rel_metric_weight=0.8, threshold=0.3)
+        assert "rel_metric_weight" not in captured and captured == {"threshold": 0.3}
+
     def test_entity_types_derived_from_full_records(self):
         captured = {}
 

@@ -118,13 +118,20 @@ def warn_if_max_types_truncates(records: Optional[List[Dict]], max_types: Option
             )
 
 
-def evaluate_and_extract_f1(model, records: List[Dict], **evaluate_kwargs) -> Tuple[float, Any]:
+def evaluate_and_extract_f1(
+    model, records: List[Dict], *, rel_metric_weight: float = 0.5, **evaluate_kwargs
+) -> Tuple[float, Any]:
     """Run ``model.evaluate(records, **evaluate_kwargs)`` and extract a single F1.
 
     Normalizes the two return shapes GLiNER's ``evaluate()`` methods use:
     ``(output, f1)`` for NER-only models, or
     ``((ner_output, ner_f1), (rel_output, rel_f1))`` for RelEx models, in
-    which case the tracked F1 is the unweighted average of the two.
+    which case the tracked F1 is ``(1 - rel_metric_weight) * ner_f1 +
+    rel_metric_weight * rel_f1``. The default 0.5 is the plain average; raising
+    it biases checkpoint selection / early stopping toward the relation (event
+    role) side, which matters for event models where the much larger entity-NER
+    F1 otherwise dominates and plateaus early while roles are still learning.
+    ``rel_metric_weight`` is ignored for NER-only models.
 
     Passes ``entity_types`` explicitly (derived from all of ``records``, not
     just ``evaluate()``'s default per-mini-batch inference) so a class the
@@ -139,7 +146,7 @@ def evaluate_and_extract_f1(model, records: List[Dict], **evaluate_kwargs) -> Tu
     first, second = result
     if isinstance(first, tuple) and isinstance(second, tuple):
         (ner_output, ner_f1), (rel_output, rel_f1) = first, second
-        f1 = (ner_f1 + rel_f1) / 2
+        f1 = (1 - rel_metric_weight) * ner_f1 + rel_metric_weight * rel_f1
         return f1, result
     output, f1 = result
     return f1, output
