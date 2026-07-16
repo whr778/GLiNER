@@ -7,6 +7,7 @@ from transformers import TrainerCallback
 
 from gliner import GLiNER
 from gliner.data_processing.trigger_types import apply_derived_trigger_types
+from gliner.training.model_card import summarize_training_data
 from gliner.training.data_utils import (
     DEFAULT_THRESHOLD_GRID,
     BestModelTracker,
@@ -50,11 +51,11 @@ class BestF1Callback(TrainerCallback):
     (``control.should_training_stop = True``) once ``patience`` is exceeded.
     """
 
-    def __init__(self, eval_records, output_dir, evaluate_kwargs, patience=None):
+    def __init__(self, eval_records, output_dir, evaluate_kwargs, patience=None, data_stats=None):
         self.eval_records = eval_records
         self.output_dir = output_dir
         self.evaluate_kwargs = evaluate_kwargs
-        self.tracker = BestModelTracker()
+        self.tracker = BestModelTracker(card_data_stats=data_stats)
         self.patience = patience
         self.evals_without_improvement = 0
 
@@ -116,6 +117,9 @@ def main(cfg_path: str):
     # event head is actually fed triggers instead of silently producing none.
     apply_derived_trigger_types(model_cfg, train_dataset)
     warn_if_max_types_truncates(train_dataset, model_cfg.get("max_types"))
+
+    # Metrics over the raw (pre-windowing) records for the saved model's card.
+    data_stats = summarize_training_data(train_dataset)
 
     train_dataset = window_records(train_dataset, max_len=cfg.model.max_len, stride=window_stride)
     print(f"Training samples: {len(train_dataset)}")
@@ -188,6 +192,7 @@ def main(cfg_path: str):
                 output_dir,
                 evaluate_kwargs={"window_stride": window_stride, "threshold": threshold},
                 patience=early_stopping_patience,
+                data_stats=data_stats,
             )
         )
 

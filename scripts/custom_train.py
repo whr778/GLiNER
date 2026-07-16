@@ -26,6 +26,7 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from gliner import GLiNER, GLiNERConfig
 from gliner.data_processing.tokenizer import WordsSplitter
 from gliner.data_processing.trigger_types import apply_derived_trigger_types
+from gliner.training.model_card import summarize_training_data
 from gliner.utils import load_config_as_namespace
 from gliner.training.data_utils import (
     BestModelTracker,
@@ -326,10 +327,13 @@ class Trainer:
         apply_derived_trigger_types(self.config, data)
         warn_if_max_types_truncates(data, getattr(self.config, "max_types", None))
 
+        # Metrics over the raw (pre-windowing) records for the saved model's card.
+        data_stats = summarize_training_data(data)
+
         data = window_records(data, max_len=self.config.max_len)
         val_records = load_multi_dataset(getattr(self.config, "val_data", None), seed=seed)
         test_records = load_multi_dataset(getattr(self.config, "test_data", None), seed=seed)
-        tracker = BestModelTracker()
+        tracker = BestModelTracker(card_data_stats=data_stats)
 
         trained_model = None
         if torch.cuda.device_count() > 1 and self.allow_distributed:

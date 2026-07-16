@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..data_processing.windowing import window_training_record
+from .model_card import write_model_card
 
 PathOrPaths = Union[str, List[str], None]
 
@@ -189,10 +190,15 @@ def sweep_thresholds(
 
 
 class BestModelTracker:
-    """Tracks the best F1 seen so far and saves the model when it improves."""
+    """Tracks the best F1 seen so far and saves the model when it improves.
 
-    def __init__(self):
+    ``card_data_stats`` (from ``summarize_training_data``) is computed once at
+    training start and reused to write a model card next to each best save.
+    """
+
+    def __init__(self, card_data_stats: Optional[Dict[str, Any]] = None):
         self.best_f1: Optional[float] = None
+        self.card_data_stats = card_data_stats
 
     def maybe_save(self, f1: float, model, output_dir: Union[str, Path]) -> bool:
         if self.best_f1 is not None and f1 <= self.best_f1:
@@ -201,6 +207,7 @@ class BestModelTracker:
         best_dir = Path(output_dir) / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(str(best_dir))
+        write_model_card(best_dir, model.config, data_stats=self.card_data_stats, best_f1=f1)
         return True
 
 

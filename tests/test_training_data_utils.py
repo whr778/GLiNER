@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,19 +85,33 @@ class TestLoadMultiDataset:
         assert actual_next == expected_next
 
 
+def _fake_model(saved=None):
+    """A stand-in model exposing save_pretrained + a config (both needed since
+    maybe_save now also writes a model card from model.config)."""
+    config = SimpleNamespace(
+        model_name="bert-base", event_mode=False, relations_layer=None,
+        max_len=384, max_width=8, max_types=25, span_mode="markerV0", triples_layer=None,
+    )
+
+    def save_pretrained(self, d):
+        if saved is not None:
+            saved.append(d)
+
+    return type("M", (), {"save_pretrained": save_pretrained, "config": config})()
+
+
 class TestBestModelTracker:
     def test_first_call_always_saves(self, tmp_path):
         tracker = BestModelTracker()
         saved = []
-        model = type("M", (), {"save_pretrained": lambda self, d: saved.append(d)})()
-        improved = tracker.maybe_save(0.5, model, tmp_path)
+        improved = tracker.maybe_save(0.5, _fake_model(saved), tmp_path)
         assert improved is True
         assert saved == [str(tmp_path / "best")]
 
     def test_lower_f1_does_not_save(self, tmp_path):
         tracker = BestModelTracker()
         calls = []
-        model = type("M", (), {"save_pretrained": lambda self, d: calls.append(d)})()
+        model = _fake_model(calls)
         tracker.maybe_save(0.8, model, tmp_path)
         improved = tracker.maybe_save(0.5, model, tmp_path)
         assert improved is False
@@ -105,11 +120,25 @@ class TestBestModelTracker:
     def test_higher_f1_saves_again(self, tmp_path):
         tracker = BestModelTracker()
         calls = []
-        model = type("M", (), {"save_pretrained": lambda self, d: calls.append(d)})()
+        model = _fake_model(calls)
         tracker.maybe_save(0.5, model, tmp_path)
         improved = tracker.maybe_save(0.9, model, tmp_path)
         assert improved is True
         assert len(calls) == 2
+
+    def test_saving_writes_a_model_card(self, tmp_path):
+        stats = {
+            "num_documents": 3, "num_entity_mentions": 5, "num_relations": 0,
+            "entity_types": ["ORG", "PER"], "relation_types": [],
+            "tokens_min": 2, "tokens_mean": 4.0, "tokens_max": 6,
+        }
+        tracker = BestModelTracker(card_data_stats=stats)
+        tracker.maybe_save(0.73, _fake_model(), tmp_path)
+        card = (tmp_path / "best" / "README.md").read_text()
+        assert "library_name: gliner" in card       # HF frontmatter
+        assert "Best validation F1:** 0.7300" in card
+        assert "Documents | 3" in card               # training-data metric
+        assert "`PER`" in card                        # label schema
 
 
 class TestDetectLanguage:
